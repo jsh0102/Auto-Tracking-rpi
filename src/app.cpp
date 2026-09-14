@@ -19,9 +19,8 @@ App::App(const Config& cfg)
       tracker_(cfg, *motor_) {}
 
 int App::run(const volatile std::sig_atomic_t& stop) {
-    LOG_I(TAG, "시작: camera=%s detect=%s motor=%s rtsp=%s",
-          cfg_.camera.backend.c_str(), cfg_.detect.backend.c_str(),
-          cfg_.motor.backend.c_str(),
+    LOG_I(TAG, "시작: detect=%s motor=%s rtsp=%s",
+          cfg_.detect.backend.c_str(), cfg_.motor.backend.c_str(),
           cfg_.stream.enabled ? cfg_.stream.rtsp_url.c_str() : "disabled");
 
     if (!source_->start()) {

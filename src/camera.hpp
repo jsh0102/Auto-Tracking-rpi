@@ -10,15 +10,11 @@
 
 // 검출 루프에 BGR 프레임을 공급하는 소스.
 //
-// [1단계 구현 메모]
-// 카메라를 직접 열지 않고 libcamera-vid 에게 맡긴 뒤 결과를 파이프로 받는다.
-// 파이프라인은 파이썬 판과 동일:
+// 구현은 libcamera 를 직접 열어 두 스트림을 동시에 받는다:
+//   main  1280x720 YUV420 → 박스 오버레이 → ffmpeg 인코딩 → RTSP
+//   lores  320x240 NV12   → BGR 변환      → 검출
 //
-//   libcamera-vid --(H.264, stdout)--> ffmpeg --+-- copy -------> RTSP push
-//                                               '-- scale+bgr24 -> 우리 stdin
-//
-// 그래서 검출용 프레임은 "압축했다가 다시 푼" 것이다. 2단계에서 libcamera
-// C++ API 로 바꾸면 이 왕복이 사라진다.
+// 압축·압축해제 왕복이 없다. 외부 프로세스는 인코딩을 맡은 ffmpeg 하나뿐이다.
 class FrameSource {
 public:
     virtual ~FrameSource() = default;
@@ -41,5 +37,4 @@ public:
                             const std::string& /*label*/) {}
 };
 
-// cfg.camera.backend 에 따라 소스를 만든다. 모르는 backend 면 std::runtime_error.
 std::unique_ptr<FrameSource> makeFrameSource(const Config& cfg);

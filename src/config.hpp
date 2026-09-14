@@ -7,7 +7,6 @@
 // 같은 config.json 을 양쪽에서 그대로 쓸 수 있다.
 
 struct CameraConfig {
-    std::string backend = "libcamera";  // libcamera(libcamera-vid 경유) | direct(직접 제어)
     int width = 1280;                   // 송출 해상도
     int height = 720;
     int fps = 30;

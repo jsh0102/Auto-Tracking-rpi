@@ -91,8 +91,7 @@ Config Config::load(const std::string& path) {
 
     if (const json* j = top.sub("camera")) {
         Section s(*j, "camera");
-        s.get("backend", c.camera.backend)
-         .get("width", c.camera.width)
+        s.get("width", c.camera.width)
          .get("height", c.camera.height)
          .get("fps", c.camera.fps)
          .get("bitrate", c.camera.bitrate)
@@ -163,7 +162,7 @@ Config Config::load(const std::string& path) {
 
 std::string Config::dump() const {
     json j;
-    j["camera"] = {{"backend", camera.backend}, {"width", camera.width},
+    j["camera"] = {{"width", camera.width},
                    {"height", camera.height}, {"fps", camera.fps},
                    {"bitrate", camera.bitrate}, {"rotation", camera.rotation},
                    {"hflip", camera.hflip}, {"vflip", camera.vflip}};

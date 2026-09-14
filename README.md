@@ -7,30 +7,35 @@
 
 | 기능 | 상태 |
 |---|---|
-| RTSP 송출 | 동작 확인됨 (실제 카메라 → 클라이언트 수신까지) |
-| 사람 검출 | 코드 작성됨. 모델 파일을 받아야 동작한다 |
+| RTSP 송출 | 동작 확인됨 (1280x720 H.264 30fps, 바운딩 박스 포함) |
+| 사람 검출 | 동작 확인됨 (MobileNet-SSD, 약 4~6 fps) |
 | 추적 (PID) | 코드 작성됨. 가짜 입력으로 부호만 확인, 실제 서보 미검증 |
 | 서보 제어 | 코드 작성됨. **하드웨어 미연결, 한 번도 실행된 적 없음** |
 
 ## 동작 구조
 
 ```
-                    ┌─ H.264 그대로 copy ──→ RTSP push ──→ MediaMTX ──→ 시청자
-libcamera-vid ──────┤   (재인코딩 없음)                      :8554/cam
- (HW 인코더)  stdout │
-                    └─ scale 320x240, bgr24 ──→ 우리 프로세스
-                                                      │
-                                            detector (MobileNet-SSD)
-                                                      │
-                                              selectTarget (sticky)
-                                                      │
-                                              PID(pan) / PID(tilt)
-                                                      │
-                                            pigpiod → MG90 ×2
+  ISP ──── 하드웨어로 두 스트림 동시 출력 ────┐
+   │                                          │
+   ▼ 1280x720 YUV420           320x240 NV12   ▼
+ [ 박스 오버레이 ]                    [ NV12 -> BGR ]
+   │                                          │
+   │                              MobileNet-SSD 검출
+   │                                          │
+   │                    박스 좌표 ◄───────────┤
+   ▼                                          ▼
+ ffmpeg (h264_v4l2m2m)              PID -> pigpiod -> MG90 x2
+   │  인코딩만. 디코딩 없음.
+   ▼
+ MediaMTX :8554 ──→ 시청자
 ```
 
-카메라는 **한 번만** 열린다. 송출용 고해상도와 검출용 저해상도를 ffmpeg 한
-프로세스가 동시에 뽑아내므로, 두 기능이 카메라를 두고 경합하지 않는다.
+libcamera C++ API 로 카메라를 직접 연다. ISP 가 두 해상도를 하드웨어로 동시에
+출력하므로 소프트웨어 축소가 없고, 검출용 프레임은 압축을 거치지 않는다.
+외부 프로세스는 인코딩을 맡은 ffmpeg 하나뿐이다.
+
+검출 좌표는 송출 프레임의 Y(밝기) 평면에 그려진다. 색 평면을 건드리지 않으므로
+변환 비용이 붙지 않는다 — 박스는 흰색으로 보인다.
 
 ## 빠른 시작
 
@@ -84,9 +89,8 @@ make clean    # 빌드 결과물 삭제
 | 키 | 의미 |
 |----|------|
 | `camera.width/height/fps/bitrate` | 송출 해상도·비트레이트 |
-| `camera.backend` | `libcamera` \| `dummy`(하드웨어 없이 테스트) |
 | `stream.rtsp_url` | 푸시할 RTSP 주소 |
-| `detect.backend` | `ssd`(권장) \| `blob`(개발용) \| `none` |
+| `detect.backend` | `ssd` \| `none` |
 | `detect.width/height/fps` | 검출 파이프라인 해상도·프레임레이트 |
 | `detect.interval` | N 프레임마다 1회 검출 (CPU 절약) |
 | `motor.pan_min/max`, `tilt_min/max` | 기구적 가동 범위(deg) |
@@ -97,19 +101,14 @@ make clean    # 빌드 결과물 삭제
 
 설정 파일에 없는 키를 쓰면 실행을 거부한다(오타를 조용히 무시하지 않는다).
 
-## 하드웨어 없이 돌려보기
+## 모델 확인
 
 ```bash
-cat > /tmp/dev.json <<'JSON'
-{"camera": {"backend": "dummy"}, "stream": {"enabled": false},
- "detect": {"backend": "blob"}, "motor": {"backend": "dummy"},
- "debug": {"log_level": "DEBUG"}}
-JSON
-./build/camtracker -c /tmp/dev.json
+./build/camtracker --check-model
 ```
 
-`dummy` 카메라가 좌우로 움직이는 사각형을 만들고 `blob` 검출기가 그걸 잡아,
-검출 → 타겟 선택 → PID → 모터 경로 전체가 동작한다. 카메라도 서보도 필요 없다.
+모델을 실제로 읽고 추론 1회를 돌려 본다. `prototxt` 와 `caffemodel` 의 짝이
+어긋난 경우는 파일을 읽는 것만으로는 드러나지 않아서, 추론까지 해봐야 한다.
 
 ## CLI
 
@@ -129,8 +128,8 @@ journalctl -fu camtracker
 
 | 파일 | 역할 |
 |------|------|
-| `src/camera.cpp` | libcamera-vid + ffmpeg 파이프라인, RTSP 푸시, 최신 프레임 슬롯 |
-| `src/detector.cpp` | `Detector` 인터페이스, MobileNet-SSD / blob, 타겟 선택 |
+| `src/camera.cpp` | libcamera 직접 제어, 듀얼 스트림, 박스 오버레이, 인코더 파이프 |
+| `src/detector.cpp` | `Detector` 인터페이스, MobileNet-SSD, 타겟 선택 |
 | `src/motor.cpp` | `PanTilt` 인터페이스, pigpiod 서보 구현, dummy |
 | `src/tracker.cpp` | PID, 화면 오차 → 각도 변화량, 소실 시 홈 복귀 |
 | `src/app.cpp` | 메인 루프, 통계, 디버그 오버레이 |
@@ -144,11 +143,9 @@ journalctl -fu camtracker
 
 - **서보 캘리브레이션 도구** — 가동 범위와 회전 방향을 실측해 `config.json` 에
   반영하는 도구가 필요하다. 서보 연결 후 작성 예정.
-- **카메라 직접 제어** — 지금은 `libcamera-vid` 에 캡처를 맡기고 결과를 파이프로
-  받는다. 그래서 검출용 프레임은 "압축했다 다시 푼" 것이고, ffmpeg 이 그 되풀이에
-  CPU 40% 를 쓴다. libcamera C++ API 로 직접 캡처하면 이 왕복이 사라진다.
-  걸림돌: 설치된 libcamera(0.0.4)와 `libcamera-dev` apt 후보(0~git20230720)의
-  버전이 어긋나 기존 `libcamera-apps` 가 깨질 위험이 있다.
+- **in-process 인코딩** — 지금은 raw YUV420 을 파이프로 ffmpeg 에 넘긴다(41MB/s).
+  libavcodec 으로 직접 인코딩하면 이 파이프와, 콜백에서의 프레임 복사가 모두
+  사라진다. 측정상 복사 1.53% + 파이프분 → 3~5%p 정도의 이득이 예상된다.
 
 ## 알려진 제약
 
