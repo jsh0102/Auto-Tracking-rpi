@@ -1,0 +1,18 @@
+[Unit]
+Description=RTSP person-tracking pan/tilt camera
+After=network-online.target mediamtx.service pigpiod.service
+Wants=network-online.target
+Requires=mediamtx.service pigpiod.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/build/camtracker --config __ROOT__/config.json
+Restart=on-failure
+RestartSec=5
+# 서보가 중립으로 돌아갈 시간을 준다
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

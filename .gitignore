@@ -1,0 +1,18 @@
+# 빌드 산출물
+build/
+tools/grab_one
+*.o
+*.d
+
+# 외부 바이너리 (scripts/install.sh 로 받음)
+bin/mediamtx
+
+# 모델 가중치 (scripts/download_model.sh 로 받음, 23MB)
+models/*.caffemodel
+models/*.prototxt
+
+# 실행 중 생성되는 것
+*.log
+*.jpg
+auto.crt
+auto.key

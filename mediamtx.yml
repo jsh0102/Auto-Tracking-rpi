@@ -1,0 +1,33 @@
+# MediaMTX 최소 설정 — 자세한 옵션은 https://github.com/bluenviron/mediamtx 참고
+logLevel: info
+readTimeout: 10s
+writeTimeout: 10s
+
+# RTSP (기본 포트 8554)
+rtsp: yes
+rtspTransports: [tcp, udp]
+rtspAddress: :8554
+
+# 브라우저에서 바로 보고 싶을 때 (http://<pi-ip>:8889/cam)
+webrtc: yes
+webrtcAddress: :8889
+
+# 안 쓰는 프로토콜은 꺼둔다
+hls: no
+rtmp: no
+srt: no
+moq: no
+
+paths:
+  # camtracker 가 ffmpeg 으로 푸시하는 경로
+  cam:
+    source: publisher
+
+# 인증이 필요하면 아래 주석을 풀고 쓸 것 (기본은 LAN 내 무인증)
+# authInternalUsers:
+#   - user: any
+#     ips: []
+#     permissions: [{action: publish, path: cam}]
+#   - user: viewer
+#     pass: changeme
+#     permissions: [{action: read, path: cam}]

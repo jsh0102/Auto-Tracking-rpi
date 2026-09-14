@@ -1,0 +1,31 @@
+{
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "bitrate": 3000000
+  },
+  "stream": {
+    "rtsp_url": "rtsp://127.0.0.1:8554/cam"
+  },
+  "detect": {
+    "backend": "ssd",
+    "confidence": 0.5,
+    "interval": 1
+  },
+  "motor": {
+    "backend": "servo",
+    "pan_pin": 12,
+    "tilt_pin": 13,
+    "pan_invert": false,
+    "tilt_invert": false
+  },
+  "track": {
+    "enabled": true,
+    "deadzone": 0.08
+  },
+  "debug": {
+    "log_level": "INFO",
+    "snapshot_path": ""
+  }
+}
