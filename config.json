@@ -17,8 +17,14 @@
     "backend": "servo",
     "pan_pin": 12,
     "tilt_pin": 13,
-    "pan_invert": false,
-    "tilt_invert": false
+    "pan_invert": true,
+    "tilt_invert": true,
+    "min_pulse_ms": 0.5,
+    "max_pulse_ms": 2.5,
+    "pan_min": -90.0,
+    "pan_max": 90.0,
+    "tilt_min": -90.0,
+    "tilt_max": 90.0
   },
   "track": {
     "enabled": true,

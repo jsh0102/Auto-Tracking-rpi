@@ -53,9 +53,16 @@ run: all
 	    exit 1; \
 	fi
 
+# 개발용 도구. 본 프로그램과 별개로 빌드한다(main 이 각자 있으므로).
+tools: tools/servo_test
+
+tools/servo_test: tools/servo_test.cpp src/config.cpp
+	$(CXX) $(CXXFLAGS) $^ -o $@ -lpigpiod_if2
+	@echo "빌드 완료 -> $@"
+
 clean:
-	rm -rf $(BUILDDIR)
+	rm -rf $(BUILDDIR) tools/servo_test
 
 -include $(DEPS)
 
-.PHONY: all run clean
+.PHONY: all run clean tools

@@ -74,6 +74,21 @@ void PanTiltTracker::update(const Detection* target, cv::Size frame_size,
     dpan = (std::fabs(err_x) < dz) ? 0.0 : pan_pid_.update(err_x);
     dtilt = (std::fabs(err_y) < dz) ? 0.0 : tilt_pid_.update(err_y);
 
+    // 판단 근거를 그대로 남긴다. 방향 문제를 추측으로 좁히지 않기 위해서다.
+    //   box    : 검출된 사람의 화면상 중심 (프레임 크기 대비)
+    //   err    : 중심에서 얼마나 벗어났나 (-1 왼쪽/아래 … +1 오른쪽/위)
+    //   d      : 이번 틱에 명령한 이동량(도)
+    //   now    : 명령 후 서보 각도
+    if (logEnabled(LogLevel::Debug)) {
+        double pan = 0;
+        double tilt = 0;
+        motor_.position(pan, tilt);
+        LOG_D(TAG,
+              "box=(%.0f,%.0f)/%dx%d  err=(%+.2f,%+.2f)  d=(%+.1f,%+.1f)  now=(%+.1f,%+.1f)",
+              c.x, c.y, frame_size.width, frame_size.height,
+              err_x, err_y, dpan, dtilt, pan, tilt);
+    }
+
     if (dpan != 0.0 || dtilt != 0.0) {
         motor_.moveBy(dpan, dtilt);
     }
