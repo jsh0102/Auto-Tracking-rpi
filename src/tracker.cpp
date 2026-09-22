@@ -1,5 +1,6 @@
 #include "tracker.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include "log.hpp"
@@ -20,7 +21,7 @@ void PID::reset() {
     has_time_ = false;
 }
 
-double PID::update(double error) {
+double PID::update(double error, double measured) {
     const auto now = std::chrono::steady_clock::now();
     double dt = 0.0;
     if (has_time_) {
@@ -37,11 +38,12 @@ double PID::update(double error) {
                                cfg_.integral_limit);
         out += cfg_.ki * integral_;
         if (has_prev_) {
-            out += cfg_.kd * (error - prev_error_) / dt;
+            // 보정된 오차가 아니라 화면에서 읽은 값의 변화로 미분한다.
+            out += cfg_.kd * (measured - prev_measured_) / dt;
         }
     }
 
-    prev_error_ = error;
+    prev_measured_ = measured;
     has_prev_ = true;
     return clampValue(out, -cfg_.max_step, cfg_.max_step);
 }
@@ -74,6 +76,9 @@ void PanTiltTracker::update(const Detection* target, cv::Size frame_size,
     // 검출·추적 결과는 과거 장면이라 방금 보낸 명령이 반영돼 있지 않다.
     // 이미 명령한 이동량이 만들 오차 변화를 미리 빼주지 않으면, 같은 오차로
     // 여러 번 명령해 크게 지나친다(실측에서 ±20도 진동).
+    const double raw_x = err_x;   // 보상 전. 미분이 쓸 값
+    const double raw_y = err_y;
+
     double ff_pan = 0.0;
     double ff_tilt = 0.0;
     if (cfg_.track.compensate_latency) {
@@ -83,8 +88,8 @@ void PanTiltTracker::update(const Detection* target, cv::Size frame_size,
     }
 
     const double dz = cfg_.track.deadzone;
-    dpan = (std::fabs(err_x) < dz) ? 0.0 : pan_pid_.update(err_x);
-    dtilt = (std::fabs(err_y) < dz) ? 0.0 : tilt_pid_.update(err_y);
+    dpan = (std::fabs(err_x) < dz) ? 0.0 : pan_pid_.update(err_x, raw_x);
+    dtilt = (std::fabs(err_y) < dz) ? 0.0 : tilt_pid_.update(err_y, raw_y);
 
     // 판단 근거를 그대로 남긴다. 방향 문제를 추측으로 좁히지 않기 위해서다.
     //   box    : 검출된 사람의 화면상 중심 (프레임 크기 대비)
@@ -111,17 +116,29 @@ void PanTiltTracker::update(const Detection* target, cv::Size frame_size,
 
 void PanTiltTracker::inFlight(std::chrono::steady_clock::time_point now,
                              double& pan, double& tilt) {
-    const auto horizon = std::chrono::milliseconds(
-        static_cast<long>(cfg_.track.latency_ms));
+    const double horizon_ms = cfg_.track.latency_ms;
+    const auto horizon = std::chrono::milliseconds(static_cast<long>(horizon_ms));
+
     // 지연 시간이 지난 명령은 이미 영상에 반영됐다고 본다.
     while (!pending_.empty() && now - pending_.front().at > horizon) {
         pending_.pop_front();
     }
+
+    // 나이에 따라 가중치를 1 → 0 으로 선형 감소시킨다.
+    //
+    // 명령이 영상에 나타나는 시점을 정확히는 모른다(프레임 타이밍, 검출/추적 경로에
+    // 따라 달라짐). 가중치 없이 "창 안이면 100%, 밖이면 0%" 로 두면 명령이 창을
+    // 벗어나는 순간 보상량이 뚝 떨어지고, 보정 오차가 그만큼 튄다.
+    // 실측에서 ff 가 -6 에서 +6 으로 한 번에 뒤집혀 오차가 0.5 튀는 것을 확인했다.
+    // 불확실한 시점을 한 점에 몰지 않고 구간에 퍼뜨리는 셈이다.
     pan = 0.0;
     tilt = 0.0;
     for (const Pending& p : pending_) {
-        pan += p.pan;
-        tilt += p.tilt;
+        const double age_ms =
+            std::chrono::duration<double, std::milli>(now - p.at).count();
+        const double w = std::max(0.0, 1.0 - age_ms / horizon_ms);
+        pan += p.pan * w;
+        tilt += p.tilt * w;
     }
 }
 
