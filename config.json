@@ -28,7 +28,7 @@
   },
   "track": {
     "enabled": true,
-    "deadzone": 0.08
+    "deadzone": 0.12
   },
   "debug": {
     "log_level": "INFO",
