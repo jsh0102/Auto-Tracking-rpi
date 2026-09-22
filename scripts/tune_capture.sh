@@ -32,7 +32,7 @@ read -rp "준비되면 Enter..." _
 
 LIBCAMERA_LOG_LEVELS=*:ERROR timeout "$SECS" \
   ./build/camtracker --log-level DEBUG 2>&1 \
-  | grep --line-buffered -E "box=|소실" | tee "$OUT"
+  | grep --line-buffered -E "box=|trk |DET |소실" | tee "$OUT"
 
 echo
 echo "==> 저장: $OUT   ($(wc -l < "$OUT") 줄)"

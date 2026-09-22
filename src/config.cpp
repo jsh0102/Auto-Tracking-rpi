@@ -116,7 +116,9 @@ Config Config::load(const std::string& path) {
          .get("backend", c.detect.backend)
          .get("confidence", c.detect.confidence)
          .get("model_dir", c.detect.model_dir)
-         .get("interval", c.detect.interval);
+         .get("interval", c.detect.interval)
+         .get("tracker", c.detect.tracker)
+         .get("redetect_interval", c.detect.redetect_interval);
         s.done();
     }
     if (const json* j = top.sub("motor")) {
@@ -144,7 +146,11 @@ Config Config::load(const std::string& path) {
         s.get("enabled", c.track.enabled)
          .get("deadzone", c.track.deadzone)
          .get("lost_timeout", c.track.lost_timeout)
-         .get("recenter_on_lost", c.track.recenter_on_lost);
+         .get("recenter_on_lost", c.track.recenter_on_lost)
+         .get("compensate_latency", c.track.compensate_latency)
+         .get("latency_ms", c.track.latency_ms)
+         .get("pan_deg_to_err", c.track.pan_deg_to_err)
+         .get("tilt_deg_to_err", c.track.tilt_deg_to_err);
         if (const json* p = s.sub("pan_pid")) loadPid(*p, "track.pan_pid", c.track.pan_pid);
         if (const json* p = s.sub("tilt_pid")) loadPid(*p, "track.tilt_pid", c.track.tilt_pid);
         s.done();
@@ -172,7 +178,8 @@ std::string Config::dump() const {
     j["detect"] = {{"width", detect.width}, {"height", detect.height},
                    {"fps", detect.fps}, {"backend", detect.backend},
                    {"confidence", detect.confidence}, {"model_dir", detect.model_dir},
-                   {"interval", detect.interval}};
+                   {"interval", detect.interval}, {"tracker", detect.tracker},
+                   {"redetect_interval", detect.redetect_interval}};
     j["motor"] = {{"backend", motor.backend}, {"pan_pin", motor.pan_pin},
                   {"tilt_pin", motor.tilt_pin}, {"min_pulse_ms", motor.min_pulse_ms},
                   {"max_pulse_ms", motor.max_pulse_ms}, {"pan_min", motor.pan_min},
@@ -184,6 +191,10 @@ std::string Config::dump() const {
     j["track"] = {{"enabled", track.enabled}, {"deadzone", track.deadzone},
                   {"lost_timeout", track.lost_timeout},
                   {"recenter_on_lost", track.recenter_on_lost},
+                  {"compensate_latency", track.compensate_latency},
+                  {"latency_ms", track.latency_ms},
+                  {"pan_deg_to_err", track.pan_deg_to_err},
+                  {"tilt_deg_to_err", track.tilt_deg_to_err},
                   {"pan_pid", dumpPid(track.pan_pid)},
                   {"tilt_pid", dumpPid(track.tilt_pid)}};
     j["debug"] = {{"log_level", debug.log_level}, {"snapshot_path", debug.snapshot_path},

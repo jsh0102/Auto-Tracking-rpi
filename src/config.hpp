@@ -3,8 +3,7 @@
 #include <string>
 
 // 실행 설정. 기본값은 여기 적힌 값이고, config.json 에 적힌 키만 덮어쓴다.
-// 파이썬 판(camtracker/config.py)과 키 이름을 일부러 똑같이 맞췄다 —
-// 같은 config.json 을 양쪽에서 그대로 쓸 수 있다.
+// 모르는 키가 있으면 실행을 거부한다 — 오타 난 설정을 조용히 무시하지 않기 위해서다.
 
 struct CameraConfig {
     int width = 1280;                   // 송출 해상도
@@ -30,7 +29,12 @@ struct DetectConfig {
     std::string backend = "ssd";        // ssd | none
     double confidence = 0.5;
     std::string model_dir = "models";
-    int interval = 1;                   // N 프레임마다 1회 검출
+    int interval = 1;                   // N 프레임마다 1회 처리
+
+    // 검출 보간: 무거운 모델은 가끔만 돌리고 사이는 가벼운 추적으로 메운다.
+    // 모델 추론이 약 220ms 인 반면 추적은 수 ms 라 처리량이 크게 오른다.
+    std::string tracker = "kcf";         // kcf | csrt | none(보간 끔)
+    int redetect_interval = 5;           // N 프레임마다 실제 검출로 보정
 };
 
 struct MotorConfig {
@@ -68,6 +72,21 @@ struct TrackConfig {
     double deadzone = 0.08;             // 화면 중심 기준 무시 영역 (정규화)
     double lost_timeout = 3.0;          // 타겟 소실 후 홈 복귀까지 대기(초)
     bool recenter_on_lost = true;
+
+    // 지연 보상 — 이미 내렸지만 아직 영상에 안 나타난 명령을 오차에서 뺀다.
+    //
+    // 검출·추적 결과는 과거 장면을 본 값이라, 방금 보낸 명령이 반영돼 있지 않다.
+    // 보정하지 않으면 같은 오차로 여러 번 명령해 카메라가 크게 오버슈트한다.
+    //
+    // deg_to_err: 1도 명령이 만드는 정규화 오차 변화량. 실측으로 구한 값이다.
+    //   로그에서 각도 변화 대비 박스 이동을 재면 6.4 픽셀/도 (수평 화각 약 50도).
+    //   pan  = 6.4 / 160(반폭)  = 0.040
+    //   tilt = 6.4 / 120(반높이) = 0.053
+    bool compensate_latency = true;
+    double latency_ms = 300.0;      // 명령이 영상에 나타나기까지 걸리는 시간
+    double pan_deg_to_err = 0.040;
+    double tilt_deg_to_err = 0.053;
+
     PIDConfig pan_pid;
     PIDConfig tilt_pid{14.0, 0.0, 2.5, 6.0, 5.0};
 };

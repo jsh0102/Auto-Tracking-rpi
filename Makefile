@@ -15,6 +15,7 @@ CXXFLAGS += $(shell pkg-config --cflags $(PKGS))
 # opencv4 는 pkg-config 가 전체 모듈을 뱉어낸다. 실제로 쓰는 건 core/imgproc/
 # imgcodecs/dnn 넷뿐이라 직접 적어 링크 시간과 의존성을 줄인다.
 LDLIBS := -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn
+LDLIBS += -lopencv_tracking -lopencv_video
 LDLIBS += -lcamera -lcamera-base
 LDLIBS += -lpigpiod_if2 -lpthread
 LDFLAGS += $(shell pkg-config --libs-only-L $(PKGS))

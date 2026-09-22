@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <deque>
 
 #include <opencv2/core.hpp>
 
@@ -39,6 +40,17 @@ public:
 private:
     void onLost();
 
+    // 아직 영상에 나타나지 않은 명령 한 건.
+    struct Pending {
+        std::chrono::steady_clock::time_point at;
+        double pan;
+        double tilt;
+    };
+
+    // latency_ms 안에 내려진 명령의 합. 이것이 "영상이 아직 모르는 이동량" 이다.
+    void inFlight(std::chrono::steady_clock::time_point now,
+                  double& pan, double& tilt);
+
     const Config& cfg_;
     PanTilt& motor_;
     PID pan_pid_;
@@ -46,4 +58,6 @@ private:
     std::chrono::steady_clock::time_point last_seen_{};
     bool has_last_seen_ = false;
     bool homed_ = true;
+
+    std::deque<Pending> pending_;
 };
