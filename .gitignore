@@ -16,3 +16,14 @@ models/*.prototxt
 *.jpg
 auto.crt
 auto.key
+
+# 커널 모듈 빌드 산출물
+*.ko
+*.mod
+*.mod.c
+*.symvers
+modules.order
+.*.cmd
+
+# 측정 자료는 재현 비용이 크므로 예외로 추적한다
+!docs/measurements/*.log

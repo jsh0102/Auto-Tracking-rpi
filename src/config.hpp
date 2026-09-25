@@ -38,7 +38,7 @@ struct DetectConfig {
 };
 
 struct MotorConfig {
-    std::string backend = "servo";      // servo | dummy
+    std::string backend = "servo";      // servo(pigpio) | kservo(커널 드라이버) | dummy
     int pan_pin = 12;                   // BCM 번호
     int tilt_pin = 13;
     // MG90(S) 기본값. 개체차가 크므로 scripts/calibrate_servo.py 로 실측 권장.
@@ -55,8 +55,10 @@ struct MotorConfig {
     bool pan_invert = false;
     bool tilt_invert = false;
     bool idle_detach = true;            // 정지 시 PWM 해제 (지터/발열 감소)
-    std::string pigpio_host = "localhost";
+    std::string pigpio_host = "localhost";   // backend=servo 일 때만 쓴다
     std::string pigpio_port = "8888";
+    // backend=kservo 일 때 쓸 장치 파일. kernel/servo/servo.ko 가 만든다.
+    std::string kservo_path = "/dev/servo0";
 };
 
 struct PIDConfig {

@@ -1,0 +1,25 @@
+# /dev/servo0 권한 — kernel/servo/servo.ko 가 만드는 장치
+#
+# 커널 모듈은 장치를 만들기만 하고 권한에는 관여하지 않는다. "누가 써도 되는가" 는
+# 시스템마다 다른 정책이라 유저스페이스가 정한다. 커널에 박으면 권한을 바꿀 때마다
+# 모듈을 다시 빌드해야 한다.
+#
+# 기본값은 root 전용(crw------- root root)이라, 일반 계정으로 도는 camtracker 가
+# 열 수 없다. 라즈베리파이는 GPIO 자원 접근을 gpio 그룹으로 관리하므로
+# (/etc/udev/rules.d/99-com.rules 의 gpiomem·gpio·pwm 규칙) 같은 체계를 따른다.
+#
+# 설치:
+#   sudo install -m 0644 99-servo.rules /etc/udev/rules.d/
+#
+# 적용 시점: 다음 insmod 때. 이미 적재 중이면 rmmod 후 다시 insmod.
+#
+# 결과:
+#   crw-rw---- 1 root gpio 236, 0 /dev/servo0
+#        └┬┘ └┬┘
+#         │   나머지 사용자: 접근 불가
+#         gpio 그룹: 읽기·쓰기
+#
+# 더 엄격하게 하려면 SUBSYSTEM=="servo" 를 조건에 덧붙일 수 있다.
+# servo0 이라는 이름을 쓰는 장치가 달리 없으므로 여기서는 생략했다.
+
+KERNEL=="servo0", GROUP="gpio", MODE="0660"

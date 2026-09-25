@@ -15,7 +15,7 @@
     "tracker": "kcf"
   },
   "motor": {
-    "backend": "servo",
+    "backend": "kservo",
     "pan_pin": 12,
     "tilt_pin": 13,
     "pan_invert": true,
