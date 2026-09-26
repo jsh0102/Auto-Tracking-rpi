@@ -4,9 +4,12 @@
 // 우회하므로 root 가 필요하고, 커널은 그 핀이 사용 중인 줄 모른다.
 // 이 모듈은 같은 일을 커널 안에서 hrtimer 로 한다.
 //
-// 지금은 B 단계 — 여기에 비상정지 버튼을 붙였다. 커널이 GPIO 인터럽트로 눌림을
-// 즉시 감지하고, /dev/button0 을 read 하며 잠들어 있는 유저 프로세스를 깨운다.
-// 정지 판단은 아직 유저스페이스가 한다 (D 에서 커널로 옮긴다).
+// 지금은 D 단계 — 커널이 GPIO 인터럽트로 눌림을 감지하고, 그 핸들러 안에서
+// 곧바로 서보를 멈춘다. 유저스페이스를 거치지 않는다.
+//
+// 이것이 가능한 이유는 펄스를 커널이 만들기 때문이다. pigpio 였다면 멈출 대상이
+// 유저 프로세스라 핸들러에서 손댈 수 없었고, 하드웨어 PWM 이었다면 pwm_disable()
+// 이 might_sleep() 이라 인터럽트 문맥에서 부를 수 없었다.
 //
 //   echo "pan 1500"    > /dev/servo0    1500us 펄스 (기본 단위)
 //   echo "pan 30deg"   > /dev/servo0    30도 -> 커널이 us 로 환산
@@ -136,6 +139,22 @@ struct button_reader {
 	u64 seen;
 };
 
+// ───────────────────────── 비상정지 상태 ─────────────────────────
+//
+// 정지 여부를 커널이 들고 있다. 이것이 유저스페이스에 있을 때와의 결정적 차이다.
+//   - 유저 프로그램이 죽어 있어도 버튼을 누르면 서보가 멈춘다
+//   - 걸려 있는 동안에는 누가 /dev/servo0 에 무엇을 써도 거부된다
+#define ESTOP_MODE_USER   0	/* 커널은 알리기만. 정지는 유저가 (B) */
+#define ESTOP_MODE_KERNEL 1	/* 커널이 핸들러 안에서 직접 정지 (D) */
+
+static int estop_mode = ESTOP_MODE_KERNEL;
+static bool estop_engaged;		/* 지금 비상정지가 걸려 있나 */
+
+// 핸들러 안에서 핀을 내리는 데 걸린 시간. D 의 지연이다.
+static u64 estop_count;
+static u64 estop_sum_ns;
+static u64 estop_max_ns;
+
 // 팬/틸트를 같은 방식으로 다루기 위한 묶음.
 struct servo_channel {
 	const char *name;		/* echo 로 지정할 이름 */
@@ -157,6 +176,8 @@ struct servo_channel {
 	u64 jit_sum_ns;
 	u64 jit_max_ns;
 	u64 jit_bucket[SERVO_JIT_BUCKETS];
+
+	unsigned int saved_us;		/* 비상정지 직전의 펄스폭. 풀 때 되돌린다 */
 };
 
 static struct servo_channel servo_ch[] = {
@@ -381,6 +402,12 @@ static ssize_t servo_write(struct file *filp, const char __user *buf,
 	size_t n = min(len, (size_t)SERVO_WRITE_MAX);
 	int ret;
 
+	// 비상정지가 걸려 있으면 어떤 명령도 받지 않는다. 이것이 "비상" 정지의
+	// 의미다. 상태를 커널이 들고 있기 때문에 거부할 수 있다 — 유저스페이스에
+	// 있었다면 다른 프로그램이 그냥 명령해 버릴 수 있다.
+	if (READ_ONCE(estop_engaged))
+		return -EBUSY;
+
 	// 유저가 준 포인터는 거짓일 수도 있고, 그 사이 해제됐을 수도 있다.
 	// 커널이 그대로 읽으면 죽는다. 그래서 검사까지 해 주는 이 함수로 복사한다.
 	if (copy_from_user(kbuf, buf, n))
@@ -484,6 +511,57 @@ static enum hrtimer_restart servo_button_settle_fn(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+// 인터럽트 핸들러 안에서 바로 불린다. 유저스페이스를 거치지 않는다.
+//
+// hrtimer_cancel() 은 여기서 부를 수 없다 — 다른 CPU 에서 도는 콜백이 끝나길
+// 기다리느라 잠들 수 있기 때문이다. 대신 두 가지를 한다:
+//   ① 핀을 지금 당장 LOW 로 내린다        → 서보는 이 순간 힘을 놓는다 (안전 확보)
+//   ② 펄스폭을 0 으로 둔다                → 다음 tick 에서 타이머가 스스로 끝난다
+static void servo_estop_toggle(void)
+{
+	const ktime_t t0 = ktime_get();
+	unsigned long flags;
+	bool engage;
+	int i;
+
+	spin_lock_irqsave(&button_lock, flags);
+	engage = !estop_engaged;
+	estop_engaged = engage;
+	spin_unlock_irqrestore(&button_lock, flags);
+
+	for (i = 0; i < ARRAY_SIZE(servo_ch); i++) {
+		struct servo_channel *ch = &servo_ch[i];
+		unsigned long f;
+
+		if (engage) {
+			spin_lock_irqsave(&ch->lock, f);
+			ch->saved_us = ch->pulse_us;	/* 풀 때 되돌리려고 */
+			ch->pulse_us = 0;		/* ② 타이머가 스스로 종료 */
+			gpiod_set_value(ch->desc, 0);	/* ① 핀은 지금 당장 */
+			ch->level = false;
+			spin_unlock_irqrestore(&ch->lock, f);
+		} else {
+			unsigned int saved;
+
+			spin_lock_irqsave(&ch->lock, f);
+			saved = ch->saved_us;
+			spin_unlock_irqrestore(&ch->lock, f);
+			servo_set_pulse(ch, saved);	/* 원래 폭으로 복구 */
+		}
+	}
+
+	if (engage) {
+		const u64 ns = ktime_to_ns(ktime_sub(ktime_get(), t0));
+
+		spin_lock_irqsave(&button_lock, flags);
+		estop_count++;
+		estop_sum_ns += ns;
+		if (ns > estop_max_ns)
+			estop_max_ns = ns;
+		spin_unlock_irqrestore(&button_lock, flags);
+	}
+}
+
 // 하드웨어가 핀 변화를 보고 CPU 를 깨운다. 양쪽 엣지를 다 받는다 —
 // 떼는 것도 봐야 "이제 놓였구나" 를 알 수 있기 때문이다.
 // hrtimer 콜백과 같은 제약을 받는다: 잠들 수 없고, 짧아야 한다.
@@ -513,11 +591,18 @@ static irqreturn_t servo_button_isr(int irq, void *dev_id)
 	}
 	spin_unlock_irqrestore(&button_lock, flags);
 
-	// wake_up 계열은 인터럽트 문맥에서 불러도 된다 (잠들지 않는다).
-	// 지연을 줄이려면 알림은 첫 엣지에 곧바로 해야 한다. 안정될 때까지
-	// 기다렸다 알리면 지연이 20ms 가 되어 인터럽트를 쓴 의미가 사라진다.
-	if (accepted)
+	if (accepted) {
+		// D — 유저를 거치지 않고 여기서 바로 멈춘다.
+		// pigpio 였다면 불가능했다(펄스를 유저 프로세스가 만드니까).
+		// 하드웨어 PWM 이었어도 불가능했다(pwm_disable 이 might_sleep).
+		if (READ_ONCE(estop_mode) == ESTOP_MODE_KERNEL)
+			servo_estop_toggle();
+
+		// wake_up 계열은 인터럽트 문맥에서 불러도 된다 (잠들지 않는다).
+		// 알림은 첫 엣지에 곧바로 한다 — 안정될 때까지 기다렸다 알리면
+		// 지연이 20ms 가 되어 인터럽트를 쓴 의미가 사라진다.
 		wake_up_interruptible(&button_wq);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -799,6 +884,82 @@ static ssize_t level_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(level);
 
+// 비상정지 상태와 모드.
+//
+//   cat /sys/class/servo/servo0/estop
+//   mode kernel  engaged 0  stops 5  avg 1.8us  max 3.2us
+//
+//   echo user   > .../estop     커널은 알리기만 한다 (B 측정용)
+//   echo kernel > .../estop     커널이 핸들러 안에서 직접 멈춘다 (D)
+//
+// 모드를 남겨 둔 이유: D 를 넣고 나면 커널이 항상 멈춰 버려서 B 를 다시 잴
+// 방법이 없어진다. 측정을 재현하려면 조건을 고를 수 있어야 한다.
+static ssize_t estop_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	unsigned long flags;
+	u64 count, sum, max, avg;
+	bool engaged;
+	int mode;
+
+	mode = READ_ONCE(estop_mode);
+
+	spin_lock_irqsave(&button_lock, flags);
+	engaged = estop_engaged;
+	count = estop_count;
+	sum = estop_sum_ns;
+	max = estop_max_ns;
+	spin_unlock_irqrestore(&button_lock, flags);
+
+	avg = count ? sum / count : 0;
+
+	return scnprintf(buf, PAGE_SIZE,
+			 "mode %s  engaged %d  stops %llu  avg %llu.%01lluus  max %llu.%01lluus\n"
+			 "핸들러 안에서 두 핀을 LOW 로 내리는 데 걸린 시간이다.\n",
+			 mode == ESTOP_MODE_KERNEL ? "kernel" : "user",
+			 engaged ? 1 : 0, count,
+			 avg / 1000, (avg % 1000) / 100,
+			 max / 1000, (max % 1000) / 100);
+}
+
+static ssize_t estop_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	char word[16];
+
+	if (sscanf(buf, "%15s", word) != 1)
+		return -EINVAL;
+
+	if (!strcmp(word, "kernel")) {
+		WRITE_ONCE(estop_mode, ESTOP_MODE_KERNEL);
+	} else if (!strcmp(word, "user")) {
+		WRITE_ONCE(estop_mode, ESTOP_MODE_USER);
+	} else if (!strcmp(word, "clear")) {
+		// 걸린 정지를 풀고 통계를 지운다. 측정을 다시 시작할 때 쓴다.
+		unsigned long flags;
+		int i;
+
+		spin_lock_irqsave(&button_lock, flags);
+		estop_engaged = false;
+		estop_count = 0;
+		estop_sum_ns = 0;
+		estop_max_ns = 0;
+		spin_unlock_irqrestore(&button_lock, flags);
+
+		for (i = 0; i < ARRAY_SIZE(servo_ch); i++)
+			servo_set_pulse(&servo_ch[i], 0);
+	} else {
+		pr_warn("estop: kernel | user | clear 중 하나여야 합니다 (\"%s\")\n",
+			word);
+		return -EINVAL;
+	}
+
+	pr_info("estop: mode=%s\n",
+		READ_ONCE(estop_mode) == ESTOP_MODE_KERNEL ? "kernel" : "user");
+	return count;
+}
+static DEVICE_ATTR_RW(estop);
+
 // ───────────────────────── 장치 두 개 가르기 ─────────────────────────
 //
 // major 는 "어느 드라이버냐", minor 는 "그 드라이버의 몇 번째 장치냐" 다.
@@ -992,6 +1153,8 @@ static int __init servo_init(void)
 		pr_warn("press 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
 	if (device_create_file(servo_device, &dev_attr_level))
 		pr_warn("level 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
+	if (device_create_file(servo_device, &dev_attr_estop))
+		pr_warn("estop 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
 
 	pr_info("적재됨 — major=%d, /dev/%s(minor %d) /dev/%s(minor %d), "
 		"서보 GPIO%u/%u, 버튼 GPIO%u\n",
@@ -1026,6 +1189,7 @@ static void __exit servo_exit(void)
 {
 	int i;
 
+	device_remove_file(servo_device, &dev_attr_estop);
 	device_remove_file(servo_device, &dev_attr_level);
 	device_remove_file(servo_device, &dev_attr_press);
 	device_remove_file(servo_device, &dev_attr_button);
@@ -1054,4 +1218,4 @@ module_exit(servo_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("JSH");
 MODULE_DESCRIPTION("MG90 pan/tilt servo PWM driver with emergency stop button");
-MODULE_VERSION("1.1");
+MODULE_VERSION("1.2");
