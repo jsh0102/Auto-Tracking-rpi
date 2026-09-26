@@ -15,11 +15,12 @@
 #
 # 결과:
 #   crw-rw---- 1 root gpio 236, 0 /dev/servo0
+#   crw-rw---- 1 root gpio 236, 1 /dev/button0
 #        └┬┘ └┬┘
 #         │   나머지 사용자: 접근 불가
 #         gpio 그룹: 읽기·쓰기
 #
-# 더 엄격하게 하려면 SUBSYSTEM=="servo" 를 조건에 덧붙일 수 있다.
-# servo0 이라는 이름을 쓰는 장치가 달리 없으므로 여기서는 생략했다.
+# SUBSYSTEM 으로 잡으면 이 드라이버가 만드는 장치 전부가 한 줄로 덮인다.
+# (servo0, button0, 그리고 앞으로 늘어날 것들)
 
-KERNEL=="servo0", GROUP="gpio", MODE="0660"
+SUBSYSTEM=="servo", GROUP="gpio", MODE="0660"

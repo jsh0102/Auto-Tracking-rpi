@@ -31,3 +31,4 @@ modules.order
 # 동영상은 용량이 커서 추적하지 않는다 (로컬·외부 보관)
 *.mp4
 tools/button_poll
+tools/button_wait

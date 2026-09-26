@@ -55,7 +55,7 @@ run: all
 	fi
 
 # 개발용 도구. 본 프로그램과 별개로 빌드한다(main 이 각자 있으므로).
-tools: tools/servo_test tools/button_poll
+tools: tools/servo_test tools/button_poll tools/button_wait
 
 tools/servo_test: tools/servo_test.cpp src/config.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ -lpigpiod_if2
@@ -66,8 +66,13 @@ tools/button_poll: tools/button_poll.cpp
 	$(CXX) -std=c++17 -Wall -Wextra -O2 $< -o $@
 	@echo "빌드 완료 -> $@"
 
+# 커널 인터럽트를 기다리는 쪽 (B 단계)
+tools/button_wait: tools/button_wait.cpp
+	$(CXX) -std=c++17 -Wall -Wextra -O2 $< -o $@
+	@echo "빌드 완료 -> $@"
+
 clean:
-	rm -rf $(BUILDDIR) tools/servo_test tools/button_poll
+	rm -rf $(BUILDDIR) tools/servo_test tools/button_poll tools/button_wait
 
 -include $(DEPS)
 

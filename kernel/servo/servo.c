@@ -4,7 +4,9 @@
 // 우회하므로 root 가 필요하고, 커널은 그 핀이 사용 중인 줄 모른다.
 // 이 모듈은 같은 일을 커널 안에서 hrtimer 로 한다.
 //
-// 지금은 C-5 단계 — 입력 형식을 갖추고 현재 상태를 읽을 수 있게 했다.
+// 지금은 B 단계 — 여기에 비상정지 버튼을 붙였다. 커널이 GPIO 인터럽트로 눌림을
+// 즉시 감지하고, /dev/button0 을 read 하며 잠들어 있는 유저 프로세스를 깨운다.
+// 정지 판단은 아직 유저스페이스가 한다 (D 에서 커널로 옮긴다).
 //
 //   echo "pan 1500"    > /dev/servo0    1500us 펄스 (기본 단위)
 //   echo "pan 30deg"   > /dev/servo0    30도 -> 커널이 us 로 환산
@@ -12,6 +14,11 @@
 //   cat /dev/servo0                     현재 상태
 //   cat /sys/class/servo/servo0/jitter  타이머 지터 통계
 //   echo 0 > /sys/class/servo/servo0/jitter   통계 초기화
+//
+//   read(/dev/button0)  버튼이 눌릴 때까지 잠든다. 깨어나면 한 줄을 돌려준다:
+//                         press 3 ktime=123456789012
+//                       ktime 은 CLOCK_MONOTONIC 나노초다. 유저의
+//                       clock_gettime(CLOCK_MONOTONIC) 과 직접 비교할 수 있다.
 //
 // 기본 단위를 us 로 둔 이유: 커널은 하드웨어가 쓰는 단위를 받고, 서보마다
 // 다른 보정값(config.json 의 min/max_pulse_ms)은 유저스페이스가 갖는다.
@@ -28,13 +35,17 @@
 #include <linux/gpio.h>
 #include <linux/hrtimer.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/kstrtox.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/pinctrl/pinconf-generic.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 
 #define SERVO_CLASS_NAME  "servo"	/* /sys/class/servo */
 #define SERVO_DEV_NAME    "servo0"	/* /dev/servo0 */
@@ -44,6 +55,28 @@
 // base 가 512 인 시스템이라면 여기에 512 를 더해야 한다.
 #define SERVO_PAN_GPIO    12
 #define SERVO_TILT_GPIO   13
+#define SERVO_BUTTON_GPIO 17		/* 비상정지 버튼. 내부 풀업, 누르면 LOW */
+
+// 기계 접점은 붙을 때도 떨어질 때도 수십 번 튄다(채터링).
+//
+// 시간 창("마지막 누름에서 N ms 안이면 무시")으로는 막을 수 없다. 누름과 뗌은
+// 사람이 얼마나 오래 쥐고 있느냐에 따라 수백 ms 떨어져 있어서, 시계만 보면
+// "눌렀다 뗀 것"과 "두 번 누른 것"이 구분되지 않는다.
+//
+// 그래서 조건을 시간이 아니라 핀 상태로 바꾼다 — **떼어진 것을 확인해야 다음
+// 누름을 받는다.** 떼는 순간에도 튀므로, 엣지가 올 때마다 정착 타이머를 뒤로
+// 밀고, 타이머가 울렸다는 것(= 이 시간 동안 엣지가 없었다)을 "안정됐다"의
+// 증거로 쓴다. 주기적으로 확인하는 폴링이 아니다.
+//
+// 하드웨어(RC)로 막지 않은 이유는 신호 경로에 시간 상수를 심으면 우리가 재려는
+// 지연에 그것이 섞이기 때문이다. BCM2711 GPIO 에는 하드웨어 디바운스가 없다.
+#define SERVO_SETTLE_MS 20
+
+// 한 드라이버가 장치 둘을 담당한다. minor 번호가 그 둘을 가른다.
+#define SERVO_MINOR_SERVO  0		/* /dev/servo0  — 펄스 지시, 상태 읽기 */
+#define SERVO_MINOR_BUTTON 1		/* /dev/button0 — 눌릴 때까지 대기 */
+#define SERVO_MINOR_COUNT  2
+#define SERVO_BUTTON_NAME  "button0"
 
 // MG90 서보 규격. config.json 의 실측값과 같은 값이다.
 //   min_pulse_ms: 0.5  ->  500us  ->  -90도
@@ -81,6 +114,27 @@ static dev_t servo_devno;		/* 커널이 배정해 준 major/minor */
 static struct cdev servo_cdev;		/* 이 장치와 함수 표를 묶는 것 */
 static struct class *servo_class;	/* /dev 노드를 만들어 달라고 할 때 필요 */
 static struct device *servo_device;
+static struct device *button_device;
+
+// ───────────────────────── 비상정지 버튼 ─────────────────────────
+//
+// 폴링은 "왔어?" 를 반복하느라 CPU 를 쓴다. 인터럽트는 하드웨어가 CPU 를 깨우므로
+// 평소 비용이 0 이다. 유저 프로세스도 물어보는 대신 대기 큐에서 잠들어 기다린다.
+static struct gpio_desc *button_desc;
+static int button_irq = -1;
+static DECLARE_WAIT_QUEUE_HEAD(button_wq);	/* 유저가 잠들어 기다리는 곳 */
+static DEFINE_SPINLOCK(button_lock);		/* 아래 세 값을 보호한다 */
+static struct hrtimer button_settle;		/* 신호가 조용해졌는지 재는 타이머 */
+static bool button_armed = true;		/* 다음 누름을 받을 준비가 됐나 */
+static u64 button_seq;				/* 받아들인 눌림 횟수 */
+static u64 button_irq_count;			/* 실제로 들어온 인터럽트 수 */
+static u64 button_reject_count;			/* 채터링으로 버린 수 */
+static ktime_t button_stamp;			/* 마지막 눌림 시각 (기준시계) */
+
+// /dev/button0 을 연 쪽마다 "어디까지 봤는지" 를 따로 들고 있어야 한다.
+struct button_reader {
+	u64 seen;
+};
 
 // 팬/틸트를 같은 방식으로 다루기 위한 묶음.
 struct servo_channel {
@@ -411,6 +465,178 @@ static ssize_t servo_read(struct file *filp, char __user *buf, size_t len,
 	return simple_read_from_buffer(buf, len, off, out, used);
 }
 
+// ───────────────────────── 버튼 인터럽트 ─────────────────────────
+
+// 엣지가 SERVO_SETTLE_MS 동안 하나도 없었을 때만 불린다.
+// 즉 지금 읽는 값은 튐이 끝난 "안정된" 값이다. 마지막 튐이 언제였는지를
+// 따로 알아낼 필요가 없다 — 이 함수가 불렸다는 사실이 곧 그 증거다.
+static enum hrtimer_restart servo_button_settle_fn(struct hrtimer *timer)
+{
+	unsigned long flags;
+
+	if (gpiod_get_value(button_desc) == 1) {
+		spin_lock_irqsave(&button_lock, flags);
+		button_armed = true;		/* 떼어졌다. 다음 누름을 받는다 */
+		spin_unlock_irqrestore(&button_lock, flags);
+	}
+	// LOW 면 아직 쥐고 있는 것이다. 다시 걸지 않는다 —
+	// 뗄 때 오는 엣지가 알아서 이 타이머를 다시 건다.
+	return HRTIMER_NORESTART;
+}
+
+// 하드웨어가 핀 변화를 보고 CPU 를 깨운다. 양쪽 엣지를 다 받는다 —
+// 떼는 것도 봐야 "이제 놓였구나" 를 알 수 있기 때문이다.
+// hrtimer 콜백과 같은 제약을 받는다: 잠들 수 없고, 짧아야 한다.
+static irqreturn_t servo_button_isr(int irq, void *dev_id)
+{
+	// 인터럽트를 받은 시각. 이후 모든 지연 측정의 기준점이다.
+	// ktime_get() 은 CLOCK_MONOTONIC 이라 유저의 clock_gettime 과 바로 비교된다.
+	const ktime_t now = ktime_get();
+	const int level = gpiod_get_value(button_desc);
+	unsigned long flags;
+	bool accepted = false;
+
+	// 엣지가 올 때마다 정착 타이머를 뒤로 민다. 이미 걸려 있으면 취소되고
+	// 새로 걸린다. 튀는 동안에는 계속 밀려서 울리지 않는다.
+	hrtimer_start(&button_settle, ms_to_ktime(SERVO_SETTLE_MS),
+		      HRTIMER_MODE_REL);
+
+	spin_lock_irqsave(&button_lock, flags);
+	button_irq_count++;
+	if (button_armed && level == 0) {
+		button_armed = false;		/* 떼어질 때까지 잠근다 */
+		button_stamp = now;
+		button_seq++;
+		accepted = true;
+	} else {
+		button_reject_count++;		/* 튐이거나, 떼는 중이거나 */
+	}
+	spin_unlock_irqrestore(&button_lock, flags);
+
+	// wake_up 계열은 인터럽트 문맥에서 불러도 된다 (잠들지 않는다).
+	// 지연을 줄이려면 알림은 첫 엣지에 곧바로 해야 한다. 안정될 때까지
+	// 기다렸다 알리면 지연이 20ms 가 되어 인터럽트를 쓴 의미가 사라진다.
+	if (accepted)
+		wake_up_interruptible(&button_wq);
+
+	return IRQ_HANDLED;
+}
+
+static int servo_button_setup(void)
+{
+	int ret;
+
+	// IRQ 를 걸기 전에 타이머를 준비해 둔다. 첫 인터럽트가 곧바로 이걸 쓴다.
+	hrtimer_init(&button_settle, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	button_settle.function = servo_button_settle_fn;
+	button_armed = true;
+
+	ret = gpio_request_one(SERVO_BUTTON_GPIO, GPIOF_IN, "servo-button");
+	if (ret) {
+		pr_err("GPIO%d 요청 실패 (%d)\n", SERVO_BUTTON_GPIO, ret);
+		return ret;
+	}
+
+	button_desc = gpio_to_desc(SERVO_BUTTON_GPIO);
+	if (!button_desc) {
+		pr_err("GPIO%d 손잡이를 얻지 못했습니다\n", SERVO_BUTTON_GPIO);
+		ret = -ENODEV;
+		goto err_free;
+	}
+
+	// 풀업을 켠다. 이 핀의 기본값은 풀다운이라(라즈베리파이는 GPIO 9~27 이 기본
+	// 풀다운) 켜지 않으면 버튼을 안 눌러도 계속 LOW 로 읽힌다.
+	// 전원이 나가면 초기화되므로 적재할 때마다 켜야 한다.
+	ret = gpiod_set_config(button_desc,
+			       PIN_CONF_PACKED(PIN_CONFIG_BIAS_PULL_UP, 0));
+	if (ret)
+		pr_warn("GPIO%d 풀업 설정 실패 (%d). 버튼이 오작동할 수 있습니다\n",
+			SERVO_BUTTON_GPIO, ret);
+
+	button_irq = gpiod_to_irq(button_desc);
+	if (button_irq < 0) {
+		pr_err("GPIO%d 인터럽트 번호를 얻지 못했습니다 (%d)\n",
+		       SERVO_BUTTON_GPIO, button_irq);
+		ret = button_irq;
+		goto err_free;
+	}
+
+	// 양쪽 엣지를 다 받는다. 누름만 받으면, 깔끔하게 떼었을 때 엣지가 하나도
+	// 안 와서 잠금이 영영 안 풀린다.
+	// IRQF_TRIGGER_BOTH 라는 상수는 없다. 둘을 OR 로 묶는 게 양쪽 엣지다.
+	ret = request_irq(button_irq, servo_button_isr,
+			  IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+			  "servo-button", NULL);
+	if (ret) {
+		pr_err("IRQ %d 등록 실패 (%d)\n", button_irq, ret);
+		goto err_free;
+	}
+
+	pr_info("버튼 GPIO%d 확보, IRQ %d, 양쪽 엣지, 정착 대기 %dms\n",
+		SERVO_BUTTON_GPIO, button_irq, SERVO_SETTLE_MS);
+	return 0;
+
+err_free:
+	button_irq = -1;
+	button_desc = NULL;
+	gpio_free(SERVO_BUTTON_GPIO);
+	return ret;
+}
+
+static void servo_button_teardown(void)
+{
+	if (button_irq >= 0) {
+		free_irq(button_irq, NULL);	/* 실행 중인 핸들러가 끝날 때까지 기다린다 */
+		button_irq = -1;
+	}
+	// IRQ 를 뗀 뒤에 세운다 — 반대로 하면 핸들러가 타이머를 다시 걸 수 있다.
+	hrtimer_cancel(&button_settle);
+	if (button_desc) {
+		gpio_free(SERVO_BUTTON_GPIO);
+		button_desc = NULL;
+	}
+}
+
+// /dev/button0 을 read 하면 새 눌림이 있을 때까지 잠든다.
+//
+// 폴링과 다른 점: 여기서 잠든 프로세스는 CPU 를 전혀 쓰지 않는다. 스케줄러가
+// 아예 실행 대상에서 빼놓기 때문이다. 인터럽트가 와야 다시 깨어난다.
+static ssize_t servo_button_read(struct file *filp, char __user *buf, size_t len,
+				 loff_t *off)
+{
+	struct button_reader *r = filp->private_data;
+	unsigned long flags;
+	char out[96];
+	size_t used;
+	u64 seq;
+	ktime_t stamp;
+	int ret;
+
+	if (!r)
+		return -EINVAL;
+
+	// 조건이 이미 참이면 안 자고 바로 지나간다.
+	// 0 이 아닌 값을 돌려주면 신호에 깨진 것이다 (-ERESTARTSYS).
+	ret = wait_event_interruptible(button_wq, READ_ONCE(button_seq) != r->seen);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&button_lock, flags);
+	seq = button_seq;
+	stamp = button_stamp;
+	spin_unlock_irqrestore(&button_lock, flags);
+	r->seen = seq;
+
+	used = scnprintf(out, sizeof(out), "press %llu ktime=%lld\n", seq,
+			 ktime_to_ns(stamp));
+	if (len < used)
+		return -EINVAL;
+	if (copy_to_user(buf, out, used))
+		return -EFAULT;
+
+	return used;
+}
+
 // ───────────────────────── 지터 통계 (sysfs) ─────────────────────────
 //
 // /dev 는 데이터가 흐르는 통로고, /sys 는 값을 하나씩 보여 주는 곳이다.
@@ -495,14 +721,100 @@ static ssize_t jitter_store(struct device *dev, struct device_attribute *attr,
 // jitter_show / jitter_store 를 찾아 연결한다.
 static DEVICE_ATTR_RW(jitter);
 
-// 커널에 넘길 함수 표. "write 가 오면 servo_write 를 불러라" 는 뜻이다.
+// 버튼 계측 — 채터링이 얼마나 걸러졌는지 숫자로 보여 준다.
 //
-// .owner 는 참조 카운트용이다. 누가 /dev/servo0 을 열어 두면 커널이 이 값을
-// 보고 rmmod 를 막아 준다 — 쓰는 중인 드라이버가 사라지면 커널이 죽으니까.
+//   cat /sys/class/servo/servo0/button
+//   irq 47  accept 12  reject 35  armed 1  level 1
+//
+// irq 는 하드웨어가 실제로 올린 인터럽트 수, accept 는 그중 누름으로 인정한 수,
+// reject 는 튐이거나 떼는 중이라 버린 수다. 폴링에서는 이 차이가 애초에 보이지
+// 않는다 — 샘플링이라 짧은 튐을 놓치기 때문이다.
+static ssize_t button_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	unsigned long flags;
+	u64 irqs, accepts, rejects;
+	bool armed;
+	int level;
+
+	level = button_desc ? gpiod_get_value(button_desc) : -1;
+
+	spin_lock_irqsave(&button_lock, flags);
+	irqs = button_irq_count;
+	accepts = button_seq;
+	rejects = button_reject_count;
+	armed = button_armed;
+	spin_unlock_irqrestore(&button_lock, flags);
+
+	return scnprintf(buf, PAGE_SIZE,
+			 "irq %llu  accept %llu  reject %llu  armed %d  level %d\n"
+			 "GPIO%d, 양쪽 엣지, 정착 대기 %dms\n",
+			 irqs, accepts, rejects, armed ? 1 : 0, level,
+			 SERVO_BUTTON_GPIO, SERVO_SETTLE_MS);
+}
+static DEVICE_ATTR_RO(button);
+
+// ───────────────────────── 장치 두 개 가르기 ─────────────────────────
+//
+// major 는 "어느 드라이버냐", minor 는 "그 드라이버의 몇 번째 장치냐" 다.
+// 같은 함수 표를 쓰되 minor 로 갈라 보낸다.
+//
+//   minor 0 → /dev/servo0    펄스 지시 · 상태 읽기
+//   minor 1 → /dev/button0   눌릴 때까지 대기
+
+static int servo_fops_open(struct inode *inode, struct file *filp)
+{
+	struct button_reader *r;
+	unsigned long flags;
+
+	if (iminor(inode) != SERVO_MINOR_BUTTON)
+		return 0;
+
+	// 연 쪽마다 "어디까지 봤는지" 를 따로 들고 있어야, 두 프로그램이 동시에
+	// 열어도 서로의 이벤트를 훔치지 않는다.
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&button_lock, flags);
+	r->seen = button_seq;		/* 연 시점 이전의 눌림은 못 본 것으로 */
+	spin_unlock_irqrestore(&button_lock, flags);
+
+	filp->private_data = r;
+	return 0;
+}
+
+static int servo_fops_release(struct inode *inode, struct file *filp)
+{
+	if (iminor(inode) == SERVO_MINOR_BUTTON)
+		kfree(filp->private_data);
+	return 0;
+}
+
+static ssize_t servo_fops_read(struct file *filp, char __user *buf, size_t len,
+			       loff_t *off)
+{
+	if (iminor(file_inode(filp)) == SERVO_MINOR_BUTTON)
+		return servo_button_read(filp, buf, len, off);
+	return servo_read(filp, buf, len, off);
+}
+
+static ssize_t servo_fops_write(struct file *filp, const char __user *buf,
+				size_t len, loff_t *off)
+{
+	if (iminor(file_inode(filp)) != SERVO_MINOR_SERVO)
+		return -EINVAL;		/* button0 에는 쓸 것이 없다 */
+	return servo_write(filp, buf, len, off);
+}
+
+// .owner 는 참조 카운트용이다. 누가 장치를 열어 두면 커널이 이 값을 보고
+// rmmod 를 막아 준다 — 쓰는 중인 드라이버가 사라지면 커널이 죽으니까.
 static const struct file_operations servo_fops = {
-	.owner = THIS_MODULE,
-	.write = servo_write,
-	.read  = servo_read,
+	.owner   = THIS_MODULE,
+	.open    = servo_fops_open,
+	.release = servo_fops_release,
+	.write   = servo_fops_write,
+	.read    = servo_fops_read,
 };
 
 // ───────────────────────── 적재 / 제거 ─────────────────────────
@@ -574,23 +886,30 @@ static int __init servo_init(void)
 			goto err_channel;
 	}
 
-	// (2) major/minor 번호를 받는다. 0 = "빈 번호 알아서 주세요", 1 = 1개만.
-	ret = alloc_chrdev_region(&servo_devno, 0, 1, SERVO_CLASS_NAME);
+	// (2) 버튼을 확보하고 인터럽트를 건다.
+	ret = servo_button_setup();
+	if (ret)
+		goto err_channel;
+
+	// (3) major/minor 번호를 받는다. 0 = "빈 번호 알아서 주세요".
+	//     이번엔 minor 를 2개 받는다 — servo0 과 button0.
+	ret = alloc_chrdev_region(&servo_devno, 0, SERVO_MINOR_COUNT,
+				  SERVO_CLASS_NAME);
 	if (ret) {
 		pr_err("장치 번호를 받지 못했습니다 (%d)\n", ret);
-		goto err_channel;
+		goto err_button;
 	}
 
-	// (3) 받은 번호와 함수 표를 묶어 커널에 등록한다.
+	// (4) 받은 번호와 함수 표를 묶어 커널에 등록한다.
 	cdev_init(&servo_cdev, &servo_fops);
 	servo_cdev.owner = THIS_MODULE;
-	ret = cdev_add(&servo_cdev, servo_devno, 1);
+	ret = cdev_add(&servo_cdev, servo_devno, SERVO_MINOR_COUNT);
 	if (ret) {
 		pr_err("cdev 등록 실패 (%d)\n", ret);
 		goto err_region;
 	}
 
-	// (4) 번호에 이름을 붙이기 위한 분류를 만든다 -> /sys/class/servo
+	// (5) 번호에 이름을 붙이기 위한 분류를 만든다 -> /sys/class/servo
 	servo_class = class_create(THIS_MODULE, SERVO_CLASS_NAME);
 	if (IS_ERR(servo_class)) {
 		ret = PTR_ERR(servo_class);
@@ -598,31 +917,50 @@ static int __init servo_init(void)
 		goto err_cdev;
 	}
 
-	// (5) /dev/servo0 을 만들어 달라고 요청한다.
-	servo_device = device_create(servo_class, NULL, servo_devno, NULL,
-				     SERVO_DEV_NAME);
+	// (6) /dev/servo0 을 만들어 달라고 요청한다.
+	servo_device = device_create(servo_class, NULL,
+				     MKDEV(MAJOR(servo_devno), SERVO_MINOR_SERVO),
+				     NULL, SERVO_DEV_NAME);
 	if (IS_ERR(servo_device)) {
 		ret = PTR_ERR(servo_device);
 		pr_err("device 생성 실패 (%d)\n", ret);
 		goto err_class;
 	}
 
-	// (6) 통계를 읽을 sysfs 파일을 단다. 없어도 서보는 동작하므로 실패해도
+	// (7) /dev/button0 — 같은 드라이버의 두 번째 장치.
+	button_device = device_create(servo_class, NULL,
+				      MKDEV(MAJOR(servo_devno), SERVO_MINOR_BUTTON),
+				      NULL, SERVO_BUTTON_NAME);
+	if (IS_ERR(button_device)) {
+		ret = PTR_ERR(button_device);
+		pr_err("button device 생성 실패 (%d)\n", ret);
+		goto err_servo_dev;
+	}
+
+	// (8) 통계를 읽을 sysfs 파일을 단다. 없어도 서보는 동작하므로 실패해도
 	//     경고만 찍고 계속한다.
 	if (device_create_file(servo_device, &dev_attr_jitter))
 		pr_warn("jitter 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
+	if (device_create_file(servo_device, &dev_attr_button))
+		pr_warn("button 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
 
-	pr_info("적재됨 — /dev/%s (major=%d minor=%d), GPIO%u/%u, 주기 %dus\n",
-		SERVO_DEV_NAME, MAJOR(servo_devno), MINOR(servo_devno),
-		SERVO_PAN_GPIO, SERVO_TILT_GPIO, SERVO_PERIOD_US);
+	pr_info("적재됨 — major=%d, /dev/%s(minor %d) /dev/%s(minor %d), "
+		"서보 GPIO%u/%u, 버튼 GPIO%u\n",
+		MAJOR(servo_devno), SERVO_DEV_NAME, SERVO_MINOR_SERVO,
+		SERVO_BUTTON_NAME, SERVO_MINOR_BUTTON,
+		SERVO_PAN_GPIO, SERVO_TILT_GPIO, SERVO_BUTTON_GPIO);
 	return 0;
 
+err_servo_dev:
+	device_destroy(servo_class, MKDEV(MAJOR(servo_devno), SERVO_MINOR_SERVO));
 err_class:
 	class_destroy(servo_class);
 err_cdev:
 	cdev_del(&servo_cdev);
 err_region:
-	unregister_chrdev_region(servo_devno, 1);
+	unregister_chrdev_region(servo_devno, SERVO_MINOR_COUNT);
+err_button:
+	servo_button_teardown();
 err_channel:
 	// i 번째에서 실패했으므로 0 .. i-1 까지만 돌려준다.
 	while (--i >= 0)
@@ -631,18 +969,25 @@ err_channel:
 }
 
 // 순서가 중요하다.
-//   먼저 /dev/servo0 을 없앤다  -> 새 write 가 들어올 길을 끊는다
+//   먼저 장치 노드를 없앤다    -> 새 요청이 들어올 길을 끊는다
+//   그다음 인터럽트를 뗀다      -> 더 이상 핸들러가 불리지 않게 한다
 //   그다음 타이머를 세운다      -> 더 이상 콜백이 불리지 않게 한다
 //   마지막에 핀을 반납한다      -> 아무도 안 만지는 상태에서
 static void __exit servo_exit(void)
 {
 	int i;
 
+	device_remove_file(servo_device, &dev_attr_button);
 	device_remove_file(servo_device, &dev_attr_jitter);
-	device_destroy(servo_class, servo_devno);
+	device_destroy(servo_class, MKDEV(MAJOR(servo_devno), SERVO_MINOR_BUTTON));
+	device_destroy(servo_class, MKDEV(MAJOR(servo_devno), SERVO_MINOR_SERVO));
 	class_destroy(servo_class);
 	cdev_del(&servo_cdev);
-	unregister_chrdev_region(servo_devno, 1);
+	unregister_chrdev_region(servo_devno, SERVO_MINOR_COUNT);
+
+	// free_irq 는 다른 CPU 에서 핸들러가 돌고 있으면 끝날 때까지 기다린다.
+	// hrtimer_cancel 과 같은 이유로 반드시 필요하다.
+	servo_button_teardown();
 
 	for (i = ARRAY_SIZE(servo_ch) - 1; i >= 0; i--)
 		servo_channel_teardown(&servo_ch[i]);
@@ -657,5 +1002,5 @@ module_exit(servo_exit);
 // GPL 전용으로 표시된 커널 함수를 쓸 수 없게 된다.
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("JSH");
-MODULE_DESCRIPTION("MG90 pan/tilt servo PWM driver (hrtimer based)");
-MODULE_VERSION("0.7");
+MODULE_DESCRIPTION("MG90 pan/tilt servo PWM driver with emergency stop button");
+MODULE_VERSION("0.9");
