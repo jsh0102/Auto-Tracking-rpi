@@ -34,6 +34,7 @@ private:
 
     Detection target_{};
     bool has_target_ = false;
+    bool estop_prev_ = false;        // 비상정지 상태가 바뀔 때만 로그를 찍으려고
 
     long frames_ = 0;
     std::chrono::steady_clock::time_point last_stat_{};

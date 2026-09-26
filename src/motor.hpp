@@ -16,6 +16,17 @@ public:
     // PWM 을 끊어 서보를 free 상태로 둔다. 지터와 발열이 줄어든다.
     virtual void release() = 0;
 
+    // 하드웨어 비상정지가 걸려 있는가.
+    //
+    // 걸려 있으면 커널이 모든 명령을 거부한다. 그걸 모르고 계속 보내면
+    // ① 실패 로그가 쏟아지고 ② moveTo 가 "갔다" 고 기록해 버려서, 해제하는
+    // 순간 서보가 그 차이만큼 한 번에 튄다. 비상정지 직후의 급격한 움직임은
+    // 가장 피해야 할 동작이다.
+    //
+    // 상태를 묻는 것이므로 sysfs 를 읽는다. /dev/button0 의 블로킹 read 는
+    // "방금 눌렸다" 는 이벤트용이고, 그건 button_wait 이 쓴다.
+    virtual bool emergencyStopped() const { return false; }
+
     void moveBy(double dpan, double dtilt) {
         double pan = 0;
         double tilt = 0;

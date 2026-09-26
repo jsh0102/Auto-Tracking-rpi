@@ -142,6 +142,16 @@ void PanTiltTracker::inFlight(std::chrono::steady_clock::time_point now,
     }
 }
 
+void PanTiltTracker::reset() {
+    pan_pid_.reset();
+    tilt_pid_.reset();
+    pending_.clear();
+
+    // 멈춰 있던 동안은 타겟을 "못 본" 게 아니라 "안 본" 것이다.
+    // 이걸 안 되돌리면 재개하는 순간 "오래 못 봤다" 로 판정해 홈으로 크게 돈다.
+    last_seen_ = std::chrono::steady_clock::now();
+}
+
 void PanTiltTracker::onLost() {
     pan_pid_.reset();
     tilt_pid_.reset();

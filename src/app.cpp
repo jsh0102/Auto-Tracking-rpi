@@ -66,9 +66,23 @@ int App::run(const volatile std::sig_atomic_t& stop) {
             source_->setOverlay(boxes, boxes.empty() ? "" : "Person");
         }
 
+        // 하드웨어 비상정지가 걸려 있으면 모터 제어만 건너뛴다.
+        // 캡처·검출·송출은 계속 돈다 — 영상은 나가야 한다.
+        //
+        // 명령을 보내지 않는 것이 중요하다. 보내면 커널이 거부해 로그가 쏟아지고,
+        // 그보다 나쁘게는 motor 쪽 "현재 각도" 기록만 앞서 나가 해제하는 순간
+        // 서보가 그 차이만큼 튄다. 안 보내면 기록이 멈춰 있어 그 문제가 없다.
+        const bool estopped = motor_->emergencyStopped();
+        if (estopped != estop_prev_) {
+            LOG_W(TAG, estopped ? "비상정지 — 추적 중단" : "비상정지 해제 — 추적 재개");
+            tracker_.reset();
+            estop_prev_ = estopped;
+        }
+
         double dpan = 0.0;
         double dtilt = 0.0;
-        tracker_.update(has_target_ ? &target_ : nullptr, frame.size(), dpan, dtilt);
+        if (!estopped)
+            tracker_.update(has_target_ ? &target_ : nullptr, frame.size(), dpan, dtilt);
 
         reportStats();
         maybeSnapshot(frame);

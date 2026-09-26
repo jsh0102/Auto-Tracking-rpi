@@ -139,7 +139,8 @@ Config Config::load(const std::string& path) {
          .get("idle_detach", c.motor.idle_detach)
          .get("pigpio_host", c.motor.pigpio_host)
          .get("pigpio_port", c.motor.pigpio_port)
-         .get("kservo_path", c.motor.kservo_path);
+         .get("kservo_path", c.motor.kservo_path)
+         .get("kservo_estop", c.motor.kservo_estop);
         s.done();
     }
     if (const json* j = top.sub("track")) {
@@ -189,7 +190,8 @@ std::string Config::dump() const {
                   {"tilt_home", motor.tilt_home}, {"pan_invert", motor.pan_invert},
                   {"tilt_invert", motor.tilt_invert}, {"idle_detach", motor.idle_detach},
                   {"pigpio_host", motor.pigpio_host}, {"pigpio_port", motor.pigpio_port},
-                  {"kservo_path", motor.kservo_path}};
+                  {"kservo_path", motor.kservo_path},
+                  {"kservo_estop", motor.kservo_estop}};
     j["track"] = {{"enabled", track.enabled}, {"deadzone", track.deadzone},
                   {"lost_timeout", track.lost_timeout},
                   {"recenter_on_lost", track.recenter_on_lost},

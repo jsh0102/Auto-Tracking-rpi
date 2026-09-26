@@ -59,6 +59,8 @@ struct MotorConfig {
     std::string pigpio_port = "8888";
     // backend=kservo 일 때 쓸 장치 파일. kernel/servo/servo.ko 가 만든다.
     std::string kservo_path = "/dev/servo0";
+    // 비상정지 상태를 읽을 곳. 빈 문자열이면 확인하지 않는다.
+    std::string kservo_estop = "/sys/class/servo/servo0/estop";
 };
 
 struct PIDConfig {

@@ -219,12 +219,35 @@ public:
                 "). 모듈이 적재됐는지(lsmod | grep servo), udev 규칙이 들어갔는지"
                 " 확인하세요.");
         }
-        LOG_I(TAG, "커널 드라이버 사용 (%s)", cfg_.kservo_path.c_str());
+        if (!cfg_.kservo_estop.empty()) {
+            estop_fd_ = ::open(cfg_.kservo_estop.c_str(), O_RDONLY | O_CLOEXEC);
+            if (estop_fd_ < 0) {
+                LOG_W(TAG, "비상정지 상태를 읽을 수 없습니다 (%s). 무시하고 진행합니다",
+                      cfg_.kservo_estop.c_str());
+            }
+        }
+        LOG_I(TAG, "커널 드라이버 사용 (%s)%s", cfg_.kservo_path.c_str(),
+              estop_fd_ >= 0 ? ", 비상정지 연동" : "");
         startServo();
+    }
+
+    // 제어 루프마다 한 번 읽는다(초당 5회). 한 번에 3µs 남짓이라 부담이 없다.
+    bool emergencyStopped() const override {
+        if (estop_fd_ < 0) return false;
+
+        char buf[128];
+        const ssize_t n = ::pread(estop_fd_, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) return false;
+        buf[n] = '\0';
+
+        // "mode kernel  engaged 1  stops 3 ..."
+        const char* p = std::strstr(buf, "engaged ");
+        return p && p[8] == '1';
     }
 
     ~KernelServoPanTilt() override {
         stopServo();
+        if (estop_fd_ >= 0) ::close(estop_fd_);
         if (fd_ >= 0) {
             release();
             ::close(fd_);
@@ -248,13 +271,21 @@ private:
 
         // 커널이 값을 거부하면(-EINVAL/-ERANGE) write 가 실패한다.
         // 조용히 넘기면 "왜 안 움직이지" 로 한참을 잃는다.
+        //
+        // 단 EBUSY 는 다르다 — 비상정지가 걸려 있어 커널이 막은 것이고,
+        // 그것이 정상 동작이다. 오류로 찍으면 로그가 쏟아져 진짜 문제가 묻힌다.
         if (::write(fd_, line, static_cast<size_t>(n)) != n) {
-            LOG_W(TAG, "%s 전송 실패 (%s): %s", cfg_.kservo_path.c_str(),
-                  std::strerror(errno), line);
+            if (errno == EBUSY) {
+                LOG_D(TAG, "비상정지 중이라 거부됨: %s", line);
+            } else {
+                LOG_W(TAG, "%s 전송 실패 (%s): %s", cfg_.kservo_path.c_str(),
+                      std::strerror(errno), line);
+            }
         }
     }
 
     int fd_ = -1;
+    int estop_fd_ = -1;
 };
 
 }  // namespace

@@ -29,7 +29,9 @@
   },
   "track": {
     "enabled": true,
-    "deadzone": 0.12
+    "deadzone": 0.12,
+    "pan_pid": { "max_step": 4.0 },
+    "tilt_pid": { "max_step": 4.0 }
   },
   "debug": {
     "log_level": "INFO",

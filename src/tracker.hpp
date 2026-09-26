@@ -44,6 +44,10 @@ public:
     // 이번 틱에 적용한 이동량을 dpan/dtilt 로 돌려준다.
     void update(const Detection* target, cv::Size frame_size, double& dpan, double& dtilt);
 
+    // 제어를 한동안 멈췄다가 다시 시작할 때 부른다(비상정지 해제 등).
+    // 멈춘 동안 쌓인 PID 이력과 지연 보상 창은 지금 상황과 무관하므로 버린다.
+    void reset();
+
 private:
     void onLost();
 
