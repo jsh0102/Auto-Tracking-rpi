@@ -10,6 +10,9 @@ bin/mediamtx
 # 모델 가중치 (scripts/download_model.sh 로 받음, 23MB)
 models/*.caffemodel
 models/*.prototxt
+# YOLOv4-tiny (docs/measurements/model.md 의 비교 측정용, 24MB)
+models/*.weights
+models/*.cfg
 
 # 실행 중 생성되는 것
 *.log
@@ -32,3 +35,6 @@ modules.order
 *.mp4
 tools/button_poll
 tools/button_wait
+
+# Claude Code 가 만드는 작업 폴더 (워크트리 등)
+.claude/

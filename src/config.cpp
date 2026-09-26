@@ -140,7 +140,10 @@ Config Config::load(const std::string& path) {
          .get("pigpio_host", c.motor.pigpio_host)
          .get("pigpio_port", c.motor.pigpio_port)
          .get("kservo_path", c.motor.kservo_path)
-         .get("kservo_estop", c.motor.kservo_estop);
+         .get("kservo_estop", c.motor.kservo_estop)
+         .get("syspwm_chip", c.motor.syspwm_chip)
+         .get("syspwm_pan_channel", c.motor.syspwm_pan_channel)
+         .get("syspwm_tilt_channel", c.motor.syspwm_tilt_channel);
         s.done();
     }
     if (const json* j = top.sub("track")) {
@@ -191,7 +194,10 @@ std::string Config::dump() const {
                   {"tilt_invert", motor.tilt_invert}, {"idle_detach", motor.idle_detach},
                   {"pigpio_host", motor.pigpio_host}, {"pigpio_port", motor.pigpio_port},
                   {"kservo_path", motor.kservo_path},
-                  {"kservo_estop", motor.kservo_estop}};
+                  {"kservo_estop", motor.kservo_estop},
+                  {"syspwm_chip", motor.syspwm_chip},
+                  {"syspwm_pan_channel", motor.syspwm_pan_channel},
+                  {"syspwm_tilt_channel", motor.syspwm_tilt_channel}};
     j["track"] = {{"enabled", track.enabled}, {"deadzone", track.deadzone},
                   {"lost_timeout", track.lost_timeout},
                   {"recenter_on_lost", track.recenter_on_lost},

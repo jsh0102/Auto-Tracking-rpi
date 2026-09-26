@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 #include <fcntl.h>
@@ -288,6 +289,122 @@ private:
     int estop_fd_ = -1;
 };
 
+// backend=syspwm — 커널 PWM 프레임워크를 sysfs 창구로 직접 구동한다.
+//
+// 펄스를 만드는 것이 CPU 가 아니라 BCM2711 안의 PWM 회로다. duty_cycle 을 한 번
+// 써 두면 회로가 그 파형을 무한히 반복한다. CPU 가 아무리 바빠도 펄스폭이
+// 흔들리지 않으므로, kservo(hrtimer)에서 부하 시 나타나던 지터가 사라진다.
+//
+// 전제 조건이 두 개 있다. 둘 다 /boot/config.txt 에 있고 재부팅이 필요하다.
+//   dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4   핀을 PWM 회로에 붙인다
+//   #dtparam=audio=on                                    오디오가 같은 채널을 쓴다
+//
+// ★ 이 백엔드에는 비상정지가 없다 — emergencyStopped() 는 기본값 false 를 쓴다.
+//   커널 모듈이 빠진 그림이라 버튼 IRQ 를 받을 주체가 없다. 하드웨어 PWM 이
+//   추적 흔들림을 얼마나 줄이는지 재기 위한 실험용 백엔드이고, 비상정지는
+//   커널 모듈을 PWM 소비자로 개조하면서 되찾는다.
+class SysPwmPanTilt : public PulseServoPanTilt {
+public:
+    explicit SysPwmPanTilt(const MotorConfig& cfg) : PulseServoPanTilt(cfg) {
+        openChannel(Axis::Pan, cfg_.syspwm_pan_channel);
+        openChannel(Axis::Tilt, cfg_.syspwm_tilt_channel);
+        LOG_I(TAG, "하드웨어 PWM 사용 (%s, 채널 %d/%d, 주기 %dus), 비상정지 없음",
+              cfg_.syspwm_chip.c_str(), cfg_.syspwm_pan_channel,
+              cfg_.syspwm_tilt_channel, kPeriodUs);
+        startServo();
+    }
+
+    ~SysPwmPanTilt() override {
+        stopServo();
+        release();
+        for (int& fd : duty_fd_) {
+            if (fd >= 0) ::close(fd);
+            fd = -1;
+        }
+        // unexport 하지 않는다. 채널을 열어 둔 채 duty=0 이면 핀은 LOW 로
+        // 붙잡혀 있고, 다음 실행이 같은 채널을 그대로 다시 쓸 수 있다.
+    }
+
+protected:
+    void sendPulse(Axis axis, int pulse_us) override {
+        writeLong(duty_fd_[index(axis)], static_cast<long>(pulse_us) * 1000);
+    }
+    // duty_cycle 0 = 펄스 없음. 핀이 LOW 로 붙잡히고 서보는 힘을 놓는다.
+    // enable 을 토글하지 않는 이유: 껐다 켜면 period 가 남아 있는지가 커널
+    // 버전에 따라 다르고, 매번 다시 써야 하는지 알 수 없어진다.
+    void sendRelease(Axis axis) override { writeLong(duty_fd_[index(axis)], 0); }
+
+private:
+    // 20ms(50Hz). servo.c 의 SERVO_PERIOD_US 와 같은 값이어야 비교가 공정하다.
+    static constexpr int kPeriodUs = 20000;
+
+    static size_t index(Axis axis) { return axis == Axis::Pan ? 0 : 1; }
+
+    void openChannel(Axis axis, int ch) {
+        const std::string dir = cfg_.syspwm_chip + "/pwm" + std::to_string(ch);
+
+        // 이전 실행이 이미 열어 둔 채널이면 export 는 EBUSY 로 실패한다.
+        // 그건 오류가 아니라 "이미 준비됨" 이므로 있는지 먼저 본다.
+        if (::access(dir.c_str(), F_OK) != 0) {
+            writeFile(cfg_.syspwm_chip + "/export", std::to_string(ch));
+        }
+
+        // export 는 디렉터리를 즉시 만들지만, 그 안의 파일을 gpio 그룹이 쓸 수
+        // 있게 바꿔 주는 것은 udev 가 나중에 한다. 곧바로 열면 EACCES 가 난다.
+        int fd = -1;
+        for (int i = 0; i < 20 && fd < 0; ++i) {
+            fd = ::open((dir + "/duty_cycle").c_str(), O_WRONLY | O_CLOEXEC);
+            if (fd < 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (fd < 0) {
+            throw std::runtime_error(
+                dir + "/duty_cycle 을 열지 못했습니다 (" + std::strerror(errno) +
+                "). dtoverlay=pwm-2chan 이 올라갔는지(ls /sys/class/pwm),"
+                " gpio 그룹에 속해 있는지 확인하세요.");
+        }
+        duty_fd_[index(axis)] = fd;
+
+        // 순서가 중요하다. duty_cycle 은 "period 중 얼마" 라서 period 가 먼저
+        // 있어야 받아들여진다. 게다가 이전 실행이 남긴 duty 가 새 period 보다
+        // 크면 그 순간 duty > period 가 되어 period 쓰기가 거부된다.
+        // 그래서 duty 를 0 으로 내린 뒤 period 를 쓴다.
+        writeLong(fd, 0);
+        writeFile(dir + "/period", std::to_string(kPeriodUs * 1000L));
+        writeFile(dir + "/enable", "1");
+    }
+
+    // sysfs 는 write 한 번이 값 하나다. 이어 쓰지 않도록 오프셋 0 에 덮어쓴다.
+    // 제어 루프마다(초당 5회 x 2채널) 불리므로 fd 는 열어 둔 채로 재사용한다.
+    static void writeLong(int fd, long value) {
+        if (fd < 0) return;
+        char buf[32];
+        const int n = std::snprintf(buf, sizeof(buf), "%ld", value);
+        if (n <= 0) return;
+        if (::pwrite(fd, buf, static_cast<size_t>(n), 0) != n) {
+            LOG_W(TAG, "duty_cycle 쓰기 실패 (%s): %ld", std::strerror(errno), value);
+        }
+    }
+
+    // 초기화용. 한 번만 쓰는 파일이라 그때그때 열고 닫는다. 실패하면 던진다 —
+    // 여기서 실패하면 펄스가 아예 안 나가므로 조용히 넘길 수 없다.
+    static void writeFile(const std::string& path, const std::string& value) {
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+        if (fd < 0) {
+            throw std::runtime_error(path + " 를 열지 못했습니다 (" +
+                                     std::strerror(errno) + ")");
+        }
+        const ssize_t n = ::write(fd, value.c_str(), value.size());
+        const int err = errno;
+        ::close(fd);
+        if (n != static_cast<ssize_t>(value.size())) {
+            throw std::runtime_error(path + " 에 \"" + value + "\" 를 쓰지 못했습니다 (" +
+                                     std::strerror(err) + ")");
+        }
+    }
+
+    int duty_fd_[2] = {-1, -1};
+};
+
 }  // namespace
 
 std::unique_ptr<PanTilt> makeMotor(const Config& cfg) {
@@ -296,12 +413,15 @@ std::unique_ptr<PanTilt> makeMotor(const Config& cfg) {
     if (backend == "dummy") {
         return std::make_unique<DummyPanTilt>(cfg.motor);
     }
-    if (backend != "servo" && backend != "kservo") {
+    if (backend != "servo" && backend != "kservo" && backend != "syspwm") {
         throw std::runtime_error("알 수 없는 motor.backend: " + backend);
     }
     try {
         if (backend == "kservo") {
             return std::make_unique<KernelServoPanTilt>(cfg.motor);
+        }
+        if (backend == "syspwm") {
+            return std::make_unique<SysPwmPanTilt>(cfg.motor);
         }
         return std::make_unique<ServoPanTilt>(cfg.motor);
     } catch (const std::exception& e) {

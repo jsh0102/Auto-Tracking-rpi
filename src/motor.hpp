@@ -39,8 +39,9 @@ public:
 // cfg.motor.backend
 //   servo   pigpiod 를 통해 제어 (유저스페이스에서 PWM 생성)
 //   kservo  /dev/servo0 에 써서 제어 (커널 모듈이 hrtimer 로 PWM 생성)
+//   syspwm  /sys/class/pwm 에 써서 제어 (칩의 하드웨어 PWM 회로가 생성)
 //   dummy   아무것도 하지 않음
 //
-// servo/kservo 인데 장치를 잡지 못하면 경고를 찍고 dummy 로 내려간다 —
+// servo/kservo/syspwm 인데 장치를 잡지 못하면 경고를 찍고 dummy 로 내려간다 —
 // 모터가 없다고 송출까지 죽일 이유가 없다.
 std::unique_ptr<PanTilt> makeMotor(const Config& cfg);

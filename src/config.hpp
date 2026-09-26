@@ -61,6 +61,12 @@ struct MotorConfig {
     std::string kservo_path = "/dev/servo0";
     // 비상정지 상태를 읽을 곳. 빈 문자열이면 확인하지 않는다.
     std::string kservo_estop = "/sys/class/servo/servo0/estop";
+    // backend=syspwm 일 때. pwm-2chan 오버레이가 만든 채널을 그대로 쓴다.
+    // 주기는 설정으로 빼지 않는다 — kernel/servo/servo.c 의 SERVO_PERIOD_US 와
+    // 같은 값이어야 두 백엔드 비교에서 "펄스 생성 방식" 만 다른 조건이 된다.
+    std::string syspwm_chip = "/sys/class/pwm/pwmchip0";
+    int syspwm_pan_channel = 0;         // GPIO12 = PWM0_0
+    int syspwm_tilt_channel = 1;        // GPIO13 = PWM0_1
 };
 
 struct PIDConfig {
