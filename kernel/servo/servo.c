@@ -754,6 +754,51 @@ static ssize_t button_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(button);
 
+// 마지막으로 받아들인 눌림의 번호와 시각. 폴링 방식(A)의 진짜 지연을 재려고 둔다.
+//
+//   cat /sys/class/servo/servo0/press
+//   14 123456789012
+//
+// 시각은 ktime_get() — CLOCK_MONOTONIC 이라 유저의 clock_gettime 과 바로 뺄 수 있다.
+// 폴링 프로그램은 엣지를 감지한 순간 자기 시각을 찍고, 여기서 커널 시각을 읽어
+// 빼면 "진짜 눌린 순간부터 알아채기까지" 가 나온다. 폴링 혼자서는 기준 시각이
+// 없어 얻을 수 없던 값이다.
+//
+// 번호를 같이 내보내는 이유: 폴링은 떼는 순간의 튐도 새 누름으로 착각하는데,
+// 그때는 번호가 안 바뀌므로 유저 쪽에서 걸러낼 수 있다.
+static ssize_t press_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	unsigned long flags;
+	u64 seq;
+	ktime_t stamp;
+
+	spin_lock_irqsave(&button_lock, flags);
+	seq = button_seq;
+	stamp = button_stamp;
+	spin_unlock_irqrestore(&button_lock, flags);
+
+	return scnprintf(buf, PAGE_SIZE, "%llu %lld\n", seq, ktime_to_ns(stamp));
+}
+static DEVICE_ATTR_RO(press);
+
+// 버튼 핀의 현재 값. 0 = 눌림, 1 = 안 눌림.
+//
+// 이 드라이버가 GPIO17 을 정식으로 요청해 두었으므로, 유저스페이스가
+// /sys/class/gpio 로 같은 핀을 가져가려 하면 커널이 EBUSY 로 막는다.
+// (pigpio 처럼 /dev/mem 으로 우회하면 이 충돌이 감지되지 않는다.)
+//
+// 그래서 폴링 방식(A)을 비교 측정할 때 쓸 통로를 드라이버가 직접 내준다.
+// 읽을 때마다 gpiod_get_value() 로 하드웨어를 보므로 sysfs GPIO 와 하는 일이 같다.
+static ssize_t level_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	if (!button_desc)
+		return -ENODEV;
+	return scnprintf(buf, PAGE_SIZE, "%d\n", gpiod_get_value(button_desc));
+}
+static DEVICE_ATTR_RO(level);
+
 // ───────────────────────── 장치 두 개 가르기 ─────────────────────────
 //
 // major 는 "어느 드라이버냐", minor 는 "그 드라이버의 몇 번째 장치냐" 다.
@@ -943,6 +988,10 @@ static int __init servo_init(void)
 		pr_warn("jitter 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
 	if (device_create_file(servo_device, &dev_attr_button))
 		pr_warn("button 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
+	if (device_create_file(servo_device, &dev_attr_press))
+		pr_warn("press 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
+	if (device_create_file(servo_device, &dev_attr_level))
+		pr_warn("level 속성을 만들지 못했습니다 (동작에는 지장 없음)\n");
 
 	pr_info("적재됨 — major=%d, /dev/%s(minor %d) /dev/%s(minor %d), "
 		"서보 GPIO%u/%u, 버튼 GPIO%u\n",
@@ -977,6 +1026,8 @@ static void __exit servo_exit(void)
 {
 	int i;
 
+	device_remove_file(servo_device, &dev_attr_level);
+	device_remove_file(servo_device, &dev_attr_press);
 	device_remove_file(servo_device, &dev_attr_button);
 	device_remove_file(servo_device, &dev_attr_jitter);
 	device_destroy(servo_class, MKDEV(MAJOR(servo_devno), SERVO_MINOR_BUTTON));
@@ -1003,4 +1054,4 @@ module_exit(servo_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("JSH");
 MODULE_DESCRIPTION("MG90 pan/tilt servo PWM driver with emergency stop button");
-MODULE_VERSION("0.9");
+MODULE_VERSION("1.1");

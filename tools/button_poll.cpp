@@ -10,9 +10,13 @@
 // 폴링은 "지연"과 "CPU"를 맞바꾼다. 간격을 줄이면 반응이 빨라지지만 CPU 를 더 쓴다.
 // 그 맞교환이 실제로 얼마인지를 재는 것이 이 프로그램의 목적이다.
 //
-// 측정하지 못하는 것: "버튼을 실제로 누른 시각". 유저스페이스는 그걸 알 수 없다.
-// 알려면 그게 이미 인터럽트다. 최악 지연은 폴링 주기로 결정된다고 볼 수밖에 없다.
-// (B 단계에서 커널이 눌린 시각을 기록하면 그때 진짜 지연을 잴 수 있다.)
+// 진짜 지연 측정: 유저스페이스 혼자서는 "버튼이 실제로 눌린 시각" 을 알 수 없다.
+// 알려면 그게 이미 인터럽트다. 그래서 커널 모듈이 인터럽트로 기록한 시각을
+// /sys/class/servo/servo0/press 에서 읽어 기준시계로 쓴다.
+//
+//   지연 = 폴링이 알아챈 시각 − 커널이 인터럽트를 받은 시각
+//
+// 모듈이 없으면 이 측정만 건너뛰고 나머지(주기·CPU)는 그대로 동작한다.
 
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -32,6 +36,10 @@ namespace {
 constexpr int DEFAULT_BUTTON_GPIO = 17;
 constexpr int DEFAULT_LED_GPIO = 27;
 constexpr const char* DEFAULT_DEV = "/dev/servo0";
+constexpr const char* DEFAULT_PRESS = "/sys/class/servo/servo0/press";
+// 모듈이 GPIO17 을 쥐고 있으면 /sys/class/gpio 로는 못 연다(EBUSY).
+// 그때는 드라이버가 내주는 이 파일을 폴링한다. 하는 일은 같다.
+constexpr const char* DRIVER_LEVEL = "/sys/class/servo/servo0/level";
 constexpr int SERVO_CENTER_US = 1500;
 
 volatile std::sig_atomic_t g_stop = 0;
@@ -109,8 +117,12 @@ void usage(const char* argv0) {
         "      --button <gpio>    버튼 핀 (기본 %d)\n"
         "      --led <gpio>       LED 핀 (기본 %d)\n"
         "      --dev <경로>       서보 장치 (기본 %s)\n"
+        "      --press <경로>     커널 기준시계 (기본 %s)\n"
+        "      --pin <경로>       버튼 값을 읽을 파일. 주면 sysfs GPIO export 를 건너뛴다\n"
+        "                         (모듈이 핀을 쥐고 있을 때: %s)\n"
         "  -h, --help             이 도움말\n",
-        argv0, DEFAULT_BUTTON_GPIO, DEFAULT_LED_GPIO, DEFAULT_DEV);
+        argv0, DEFAULT_BUTTON_GPIO, DEFAULT_LED_GPIO, DEFAULT_DEV, DEFAULT_PRESS,
+        DRIVER_LEVEL);
 }
 
 // "10ms", "500us", "1000" 을 마이크로초로.
@@ -133,6 +145,8 @@ int main(int argc, char** argv) {
     int button_gpio = DEFAULT_BUTTON_GPIO;
     int led_gpio = DEFAULT_LED_GPIO;
     std::string dev = DEFAULT_DEV;
+    std::string press_path = DEFAULT_PRESS;
+    std::string pin_path;          // 비어 있으면 sysfs GPIO 를 export 해서 쓴다
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -161,6 +175,14 @@ int main(int argc, char** argv) {
             const char* v = next();
             if (!v) return 1;
             dev = v;
+        } else if (!std::strcmp(a, "--press")) {
+            const char* v = next();
+            if (!v) return 1;
+            press_path = v;
+        } else if (!std::strcmp(a, "--pin")) {
+            const char* v = next();
+            if (!v) return 1;
+            pin_path = v;
         } else if (!std::strcmp(a, "-h") || !std::strcmp(a, "--help")) {
             usage(argv[0]);
             return 0;
@@ -174,26 +196,39 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    // sysfs 는 풀업을 못 켠다. 하드웨어 설정이라 raspi-gpio 에 맡긴다.
-    // 풀업이 없으면 버튼을 안 눌러도 계속 LOW 로 읽힌다.
-    {
+    // 모듈이 핀을 쥐고 있으면 sysfs GPIO 로는 못 연다. 그때는 --pin 으로
+    // 드라이버가 내주는 파일을 쓴다. 그 경우 풀업도 모듈이 이미 켜 두었다.
+    if (pin_path.empty()) {
+        // sysfs 는 풀업을 못 켠다. 하드웨어 설정이라 raspi-gpio 에 맡긴다.
+        // 풀업이 없으면 버튼을 안 눌러도 계속 LOW 로 읽힌다.
         char cmd[128];
         std::snprintf(cmd, sizeof(cmd), "raspi-gpio set %d ip pu 2>/dev/null", button_gpio);
         if (std::system(cmd) != 0) {
             std::fprintf(stderr, "경고: 풀업을 켜지 못했습니다. "
                                  "raspi-gpio set %d ip pu 를 직접 실행해 보세요\n", button_gpio);
         }
+        if (!gpioExport(button_gpio, "in")) {
+            std::fprintf(stderr, "  모듈이 GPIO%d 를 쥐고 있으면 이렇게 쓰세요:\n"
+                                 "    --pin %s\n", button_gpio, DRIVER_LEVEL);
+            return 1;
+        }
+        pin_path = gpioDir(button_gpio) + "/value";
     }
-
-    if (!gpioExport(button_gpio, "in")) return 1;
     if (!gpioExport(led_gpio, "out")) return 1;
 
-    const int btn_fd = ::open((gpioDir(button_gpio) + "/value").c_str(), O_RDONLY);
+    const int btn_fd = ::open(pin_path.c_str(), O_RDONLY);
     const int led_fd = ::open((gpioDir(led_gpio) + "/value").c_str(), O_WRONLY);
     if (btn_fd < 0 || led_fd < 0) {
         std::fprintf(stderr, "value 파일을 열지 못했습니다: %s\n", std::strerror(errno));
         return 1;
     }
+
+    // 커널 기준시계. 없으면(모듈 미적재) 지연 측정만 건너뛴다.
+    const int press_fd = ::open(press_path.c_str(), O_RDONLY);
+    if (press_fd < 0)
+        std::fprintf(stderr, "경고: %s 를 열지 못했습니다 (%s). "
+                             "지연 측정 없이 진행합니다\n",
+                     press_path.c_str(), std::strerror(errno));
 
     const int dev_fd = ::open(dev.c_str(), O_WRONLY);
     if (dev_fd < 0) {
@@ -211,7 +246,7 @@ int main(int argc, char** argv) {
         read_cost_us = (nowNs() - t0) / 1000.0 / N;
     }
 
-    std::printf("버튼 GPIO%d, LED GPIO%d, 장치 %s\n", button_gpio, led_gpio, dev.c_str());
+    std::printf("버튼 %s, LED GPIO%d, 장치 %s\n", pin_path.c_str(), led_gpio, dev.c_str());
     if (busy) std::printf("모드: busy (안 자고 계속 확인)\n");
     else      std::printf("모드: sleep, 요청 간격 %ldus\n", interval_us);
     std::printf("읽기 1회 비용: %.2fus\n", read_cost_us);
@@ -222,6 +257,24 @@ int main(int argc, char** argv) {
     bool stopped = false;
     int prev = 1;             // 풀업이므로 평소 HIGH
     long presses = 0, loops = 0;
+
+    // 커널 기준시계로 재는 진짜 지연
+    unsigned long long kseq_last = 0;
+    long measured = 0;
+    int64_t lat_sum = 0, lat_min = INT64_MAX, lat_max = INT64_MIN;
+
+    // "seq ns" 한 줄을 읽는다. 실패하면 false.
+    auto readPress = [&](unsigned long long& seq, long long& ns) {
+        if (press_fd < 0) return false;
+        char b[64] = {0};
+        if (::pread(press_fd, b, sizeof(b) - 1, 0) <= 0) return false;
+        return std::sscanf(b, "%llu %lld", &seq, &ns) == 2;
+    };
+
+    if (press_fd >= 0) {
+        long long ns = 0;
+        readPress(kseq_last, ns);   // 시작 시점 번호를 기억해 둔다
+    }
 
     ::write(led_fd, "0", 1);
     servoSet(dev_fd, false);
@@ -238,11 +291,44 @@ int main(int argc, char** argv) {
 
             // 떨어지는 엣지(HIGH→LOW)가 "방금 눌렸다" 는 뜻이다.
             if (prev == 1 && level == 0) {
+                const int64_t t_user = nowNs();   // 알아챈 순간을 먼저 찍는다
                 presses++;
-                stopped = !stopped;              // 토글 — 비상정지는 손을 떼도 유지돼야 한다
-                ::write(led_fd, stopped ? "1" : "0", 1);
-                servoSet(dev_fd, stopped);
-                std::printf("[%ld] 버튼 → %s\n", presses, stopped ? "정지" : "재개");
+
+                // 커널 번호가 올라올 때까지 잠깐 기다린다. 인터럽트 처리와
+                // 폴링이 동시에 달리므로, 폴링이 먼저 LOW 를 볼 수 있다.
+                // 시각은 이미 찍었으므로 확인이 늦어도 값은 안 밀린다.
+                unsigned long long kseq = kseq_last;
+                long long kns = 0;
+                for (int t = 0; t < 50 && press_fd >= 0; t++) {
+                    if (readPress(kseq, kns) && kseq != kseq_last) break;
+                }
+
+                if (press_fd >= 0 && kseq != kseq_last) {
+                    // 커널이 새 누름으로 인정했다 → 진짜 지연
+                    const int64_t lat = t_user - kns;
+                    kseq_last = kseq;
+                    measured++;
+                    lat_sum += lat;
+                    if (lat < lat_min) lat_min = lat;
+                    if (lat > lat_max) lat_max = lat;
+
+                    stopped = !stopped;
+                    ::write(led_fd, stopped ? "1" : "0", 1);
+                    servoSet(dev_fd, stopped);
+                    std::printf("[%ld] 버튼 → %-4s  지연 %.1fus\n", presses,
+                                stopped ? "정지" : "재개", lat / 1000.0);
+                } else if (press_fd >= 0) {
+                    // 번호가 그대로다 = 커널이 튐으로 버린 것.
+                    // 폴링만으로는 이걸 구분할 수 없어 오작동했던 부분이다.
+                    std::printf("[%ld] (튐으로 판정 — 커널이 인정하지 않음)\n",
+                                presses);
+                } else {
+                    stopped = !stopped;
+                    ::write(led_fd, stopped ? "1" : "0", 1);
+                    servoSet(dev_fd, stopped);
+                    std::printf("[%ld] 버튼 → %s\n", presses,
+                                stopped ? "정지" : "재개");
+                }
                 std::fflush(stdout);
             }
             prev = level;
@@ -277,9 +363,10 @@ int main(int argc, char** argv) {
     servoSet(dev_fd, true);
     ::write(led_fd, "0", 1);
     if (dev_fd >= 0) ::close(dev_fd);
+    if (press_fd >= 0) ::close(press_fd);
     ::close(btn_fd);
     ::close(led_fd);
-    gpioUnexport(button_gpio);
+    if (pin_path.rfind("/sys/class/gpio/", 0) == 0) gpioUnexport(button_gpio);
     gpioUnexport(led_gpio);
 
     std::printf("\n");
@@ -293,9 +380,19 @@ int main(int argc, char** argv) {
                 wall_us > 0 ? cpu_us * 100.0 / wall_us : 0.0,
                 wall_us > 0 ? cpu_us * 100.0 / wall_us / 4.0 : 0.0);
     std::printf(" 읽기 1회 비용     %.2fus\n", read_cost_us);
-    std::printf(" 버튼 눌림         %ld회\n", presses);
+    std::printf(" 엣지 감지         %ld회\n", presses);
     std::printf("────────────────────────────────────────\n");
-    std::printf(" 최악 지연 = 실제 주기 = %.1fus\n", actual_period_us);
-    std::printf("   버튼이 확인 직후에 눌리면 이만큼 모른다\n");
+    if (measured > 0) {
+        std::printf(" 진짜 지연 (커널 기준시계, %ld회)\n", measured);
+        std::printf("   최소 %.1fus / 평균 %.1fus / 최대 %.1fus\n",
+                    lat_min / 1000.0, (double)lat_sum / measured / 1000.0,
+                    lat_max / 1000.0);
+        std::printf(" 구조적 상한 (= 실제 주기) %.1fus\n", actual_period_us);
+        std::printf("   눌리는 시점은 주기 안 아무 때나이므로 평균은 주기의 절반에\n");
+        std::printf("   가까워야 한다.\n");
+    } else {
+        std::printf(" 진짜 지연         측정 못 함 (모듈이 적재됐는지 확인)\n");
+        std::printf(" 최악 지연 = 실제 주기 = %.1fus\n", actual_period_us);
+    }
     return 0;
 }
