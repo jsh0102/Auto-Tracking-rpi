@@ -8,6 +8,7 @@
 | [jitter.md](jitter.md) | hrtimer 타이머 지터. 4개 조건, 히스토그램, 원인 추적 |
 | [cpu.md](cpu.md) | pigpio vs 커널 모듈 CPU 사용률 |
 | [tracking.md](tracking.md) | 실제 추적 로그 분석 |
+| [button_latency.md](button_latency.md) | 비상정지 버튼 — 폴링 vs 인터럽트 지연·CPU |
 | `tracking_kservo.log` | 위 분석의 원본 로그 (290줄) |
 
 ## 측정 환경
@@ -32,4 +33,8 @@ sudo ./scripts/bench_pwm.sh
 
 # 추적 로그
 SECS=40 ./scripts/tune_capture.sh docs/measurements/tracking_kservo.log
+
+# 버튼 폴링 기준선 (조건당 20초, 버튼을 몇 번 눌러야 함)
+./tools/button_poll --interval 10ms --seconds 20
+./tools/button_poll --busy --seconds 20
 ```

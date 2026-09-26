@@ -55,14 +55,19 @@ run: all
 	fi
 
 # 개발용 도구. 본 프로그램과 별개로 빌드한다(main 이 각자 있으므로).
-tools: tools/servo_test
+tools: tools/servo_test tools/button_poll
 
 tools/servo_test: tools/servo_test.cpp src/config.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ -lpigpiod_if2
 	@echo "빌드 완료 -> $@"
 
+# 유저스페이스 폴링 기준선 (A 단계). pigpio 를 쓰지 않는다 — 비교 대상이므로.
+tools/button_poll: tools/button_poll.cpp
+	$(CXX) -std=c++17 -Wall -Wextra -O2 $< -o $@
+	@echo "빌드 완료 -> $@"
+
 clean:
-	rm -rf $(BUILDDIR) tools/servo_test
+	rm -rf $(BUILDDIR) tools/servo_test tools/button_poll
 
 -include $(DEPS)
 

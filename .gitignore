@@ -27,3 +27,7 @@ modules.order
 
 # 측정 자료는 재현 비용이 크므로 예외로 추적한다
 !docs/measurements/*.log
+
+# 동영상은 용량이 커서 추적하지 않는다 (로컬·외부 보관)
+*.mp4
+tools/button_poll
