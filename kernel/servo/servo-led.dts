@@ -1,0 +1,50 @@
+/*
+ * servo-led — 비상정지 상태를 보여줄 LED 를 커널에 등록한다.
+ *
+ * 드라이버가 GPIO 를 직접 잡지 않는 이유:
+ *   servo.ko 는 "정지 중 / 동작 중" 이라는 사실만 트리거로 발행하고,
+ *   그걸 어느 불로 보여줄지는 밖에서 정한다. LED 를 늘리거나 핀을 옮기거나
+ *   색을 바꿔도 드라이버 코드는 그대로다.
+ *
+ *   커널   무엇이 일어났나 (led_trigger_event)
+ *   유저   그걸 어디에 보여줄까 (echo ... > /sys/class/leds/estop/trigger)
+ *
+ * LED 를 추가하려면 아래 estop_led 블록을 복사해 핀 번호와 label 만 바꾸면 된다.
+ *
+ * 빌드와 적용:
+ *   dtc -@ -I dts -O dtb -o servo-led.dtbo servo-led.dts
+ *   sudo cp servo-led.dtbo /boot/overlays/
+ *   sudo dtoverlay servo-led            # 지금 바로 (재부팅 불필요)
+ *   config.txt 에 dtoverlay=servo-led   # 다음 부팅부터
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			servo_leds {
+				compatible = "gpio-leds";
+
+				estop_led {
+					label = "estop";
+
+					/* GPIO27 (물리 13번) — 저항 → LED → GND.
+					 * 두 번째 값 0 = ACTIVE_HIGH (HIGH 일 때 켜짐) */
+					gpios = <&gpio 27 0>;
+
+					default-state = "off";
+
+					/* linux,default-trigger = "servo-estop"; 를 여기에 적으면
+					 * 부팅 직후부터 자동으로 따라간다. 지금은 손으로 연결해
+					 * 동작을 눈으로 확인한 뒤에 넣는다. */
+				};
+			};
+		};
+	};
+};

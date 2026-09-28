@@ -319,3 +319,60 @@ hrtimer 로 핀을 흔드는 부분만 칩에 넘기고, 캐릭터 디바이스�
 핀 자유도는 개조 후에도 못 찾아온다. 하드웨어가 그 핀에만 회로를 붙여 놓았기
 때문이고, 서보 2개짜리 이 프로젝트에서는 문제가 되지 않는다. 잃는 것을 알고 하는
 거래다.
+
+---
+
+## 완료 — 커널 드라이버가 하드웨어 PWM 을 쓴다 (2026-09-28)
+
+### ②는 후보 하나가 막혀 있었다
+
+```
+drivers/pwm/core.c:856   void pwm_add_table(...) { ... }
+                          정의는 있는데 EXPORT_SYMBOL 이 없다
+Module.symvers            목록에도 없다  ->  insmod 때 Unknown symbol 로 실패
+```
+
+커널에 빌트인되는 보드 코드용이지 외부 모듈용이 아니다. **디바이스 트리가 유일한
+길이었다.**
+
+### 만든 것
+
+```
+kernel/servo/servo-pwm.dts   "servo 장치가 PWM 0·1번을 쓴다" 를 선언
+                             pwms = <&pwm 0 20000000>, <&pwm 1 20000000>
+servo.c                      platform_driver 로 바꾸고 probe 에서 devm_pwm_get()
+                             servo_set_pulse 가 pwm_apply_state 로 duty 만 바꾼다
+```
+
+`pwm-2chan` 오버레이는 **빼지 않고 함께 쓴다** — 그쪽이 핀을 PWM 회로에 붙이고(ALT0)
+PWM 노드를 켜고 클럭을 설정한다. 우리 오버레이는 소비자 선언만 한다.
+
+`/dev/servo0` 인터페이스는 한 글자도 바뀌지 않았다. **camtracker 의 설정도
+`backend: kservo` 그대로다** — 유저스페이스 코드를 고치지 않고 펄스 생성 방식만
+hrtimer 에서 하드웨어 PWM 으로 바뀌었다. 인터페이스를 좁게 고정해 둔 값어치다.
+어제 만든 `syspwm` 백엔드는 이제 비교·실험용으로만 남는다.
+
+### 겪은 것 — 핀 소유권은 우리 책임이었다
+
+```
+gpiod_get    거절당하지 않는다. pinctrl 이 핀 기능을 ALT0 -> GPIO 로 바꿔서 내준다
+             -> PWM 모드에서는 gpiod 를 아예 잡지 않도록 했다
+gpio_free    핀 기능을 되돌려 주지 않는다
+             -> rmmod 뒤 핀이 GPIO 출력으로 남아 PWM 파형이 밖으로 못 나갔다
+             -> raspi-gpio 로 손수 고쳤고, 그래서 모듈이 적재 전 fsel 을 기록해
+                두었다가 제거할 때 되돌리게 했다
+```
+
+커널이 해주는 일과 우리가 책임질 일의 경계를 실물로 배운 대목이다.
+
+### 비상정지는 두 방법을 다 만들어 쟀다
+
+`pwm_disable()` 이 `might_sleep()` 이라 IRQ 핸들러에서 못 부른다.
+
+| 방법 | 지연 | 대가 |
+| --- | --- | --- |
+| pinmux (상반부, 레지스터 직접) | 8.0us | pinctrl 장부와 어긋난다 |
+| **thread** (하반부, 정식 API) | 45.7us | 스레드를 깨우는 시간 |
+
+기본값은 `thread` 다. 1.6us 는 측정 결과였지 요구사항이 아니었고, 규약을 깨는 쪽을
+기본으로 삼을 이유가 없다. -> [button_latency.md](button_latency.md)

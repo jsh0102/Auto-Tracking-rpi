@@ -41,9 +41,12 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/kstrtox.h>
+#include <linux/leds.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/io.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/pinctrl/pinconf-generic.h>
 #include <linux/platform_device.h>
 #include <linux/pwm.h>
@@ -151,6 +154,99 @@ struct button_reader {
 #define ESTOP_MODE_KERNEL 1	/* 커널이 핸들러 안에서 직접 정지 (D) */
 
 static int estop_mode = ESTOP_MODE_KERNEL;
+
+/* 실제로 어느 경로로 멈췄는지. 측정할 때 이 값이 곧 조건 이름이 된다.
+ *   irq     상반부(하드 IRQ) 안에서 끝냈다      — GPIO 모드
+ *   thread  하반부(커널 스레드)로 넘겨서 끝냈다 — 하드웨어 PWM 모드 */
+#define ESTOP_PATH_NONE   0
+#define ESTOP_PATH_IRQ    1
+#define ESTOP_PATH_THREAD 2
+static int estop_path;
+
+/* 상반부가 찍는 시각. 하반부로 넘길 때 이걸 기준으로 지연을 잰다 —
+ * 스레드를 깨우는 시간까지 포함해야 D(1.6us)와 같은 잣대가 된다. */
+static ktime_t estop_req_ts;
+
+/* 하드웨어 PWM 을 쓸 때 어떻게 멈출 것인가. sysfs 로 고를 수 있게 둔 이유는
+ * 둘을 같은 조건에서 번갈아 재기 위해서다.
+ *
+ *   thread  하반부에서 pwm_apply_state() 로 PWM 을 끈다
+ *           정식 API. pinctrl 장부와 어긋나지 않는다. 스레드를 깨우는 지연이 붙는다
+ *   pinmux  상반부에서 GPFSEL 레지스터를 직접 써 핀을 PWM 에서 떼어낸다
+ *           잠들지 않아 즉시. 대신 커널 몰래 핀 기능을 바꾸는 것이라
+ *           되돌리는 책임이 우리에게 있다 */
+#define ESTOP_METHOD_THREAD 0
+#define ESTOP_METHOD_PINMUX 1
+static int estop_method = ESTOP_METHOD_THREAD;
+
+/* LED 트리거 — 드라이버는 "무슨 일이 있었나" 만 알린다.
+ * 어느 불로 보여줄지는 유저가 정한다:
+ *   echo servo-estop > /sys/class/leds/estop/trigger
+ *
+ * 둘로 나눈 이유: 초록(동작 중)과 빨강(정지 중)처럼 서로 반대인 표시를
+ * 코드 수정 없이 붙일 수 있게 하기 위해서다. LED 가 몇 개든, 어느 핀이든,
+ * 무슨 색이든 드라이버는 그대로다. */
+static struct led_trigger *estop_led_trig;	/* 정지 중 */
+static struct led_trigger *run_led_trig;	/* 동작 중 */
+
+/* BCM2711 GPIO 레지스터. 방법 pinmux 에서만 쓴다.
+ * 주소는 디바이스 트리에서 받아 오므로 하드코딩하지 않는다. */
+static void __iomem *gpio_regs;
+static DEFINE_SPINLOCK(gpio_reg_lock);
+
+#define GPIO_FSEL_IN	0x0
+#define GPIO_FSEL_OUT	0x1
+#define GPIO_FSEL_ALT0	0x4
+#define GPIO_GPCLR0	0x28
+
+// 핀 기능을 바꾼다. 레지스터 하나에 핀 10개가 3비트씩 들어 있어
+// 읽고-고치고-쓰기를 해야 하고, 그래서 자물쇠가 필요하다.
+// 이 자물쇠는 우리 모듈 안에서만 유효하다 — 커널의 pinctrl 이 같은 레지스터를
+// 건드리면 막을 방법이 없다. 그것이 이 방법의 근본적인 대가다.
+static void servo_pin_set_func(unsigned int gpio, u32 fsel)
+{
+	const u32 off = (gpio / 10) * 4;	/* GPFSEL0,1,2 … */
+	const u32 shift = (gpio % 10) * 3;
+	unsigned long flags;
+	u32 v;
+
+	if (!gpio_regs)
+		return;
+
+	spin_lock_irqsave(&gpio_reg_lock, flags);
+	v = readl(gpio_regs + off);
+	v &= ~(0x7u << shift);
+	v |= (fsel & 0x7u) << shift;
+	writel(v, gpio_regs + off);
+	spin_unlock_irqrestore(&gpio_reg_lock, flags);
+}
+
+// 지금 핀 기능을 읽는다 (0=입력, 1=출력, 4=ALT0 …).
+static u32 servo_pin_get_func(unsigned int gpio)
+{
+	const u32 off = (gpio / 10) * 4;
+	const u32 shift = (gpio % 10) * 3;
+
+	if (!gpio_regs)
+		return GPIO_FSEL_IN;
+
+	return (readl(gpio_regs + off) >> shift) & 0x7u;
+}
+
+// 핀을 PWM 회로에서 떼어내고 LOW 로 내린다. 인터럽트 문맥에서 불러도 된다.
+static void servo_pin_detach(unsigned int gpio)
+{
+	servo_pin_set_func(gpio, GPIO_FSEL_OUT);
+	if (gpio_regs)
+		writel(1u << gpio, gpio_regs + GPIO_GPCLR0);
+}
+
+// 핀을 다시 PWM 회로에 붙인다. duty 를 건드린 적이 없으므로
+// 이 한 번의 쓰기로 원래 펄스가 곧바로 되살아난다.
+static void servo_pin_attach(unsigned int gpio)
+{
+	servo_pin_set_func(gpio, GPIO_FSEL_ALT0);
+}
 static bool estop_engaged;		/* 지금 비상정지가 걸려 있나 */
 
 // 핸들러 안에서 핀을 내리는 데 걸린 시간. D 의 지연이다.
@@ -181,6 +277,12 @@ struct servo_channel {
 	u64 jit_bucket[SERVO_JIT_BUCKETS];
 
 	unsigned int saved_us;		/* 비상정지 직전의 펄스폭. 풀 때 되돌린다 */
+
+	/* 모듈이 들어오기 전 핀 기능. 나갈 때 이 값으로 되돌린다.
+	 * "PWM 모드였으니 ALT0 이었겠지" 라고 추측하지 않고 실제로 읽어 둔다 —
+	 * hrtimer 모드로 돌았어도 원래 ALT0 이었으면 ALT0 으로 돌아가야 한다. */
+	u32 saved_fsel;
+	bool fsel_saved;
 
 	/* 디바이스 트리(servo-pwm 오버레이)에서 받아온 하드웨어 PWM 채널.
 	 * 오버레이가 없거나 probe 가 불리지 않으면 NULL 이고, 그때는 아래의
@@ -556,9 +658,12 @@ static enum hrtimer_restart servo_button_settle_fn(struct hrtimer *timer)
 // 기다리느라 잠들 수 있기 때문이다. 대신 두 가지를 한다:
 //   ① 핀을 지금 당장 LOW 로 내린다        → 서보는 이 순간 힘을 놓는다 (안전 확보)
 //   ② 펄스폭을 0 으로 둔다                → 다음 tick 에서 타이머가 스스로 끝난다
-static void servo_estop_toggle(void)
+// 정지/해제를 토글한다.
+//   t0    지연 측정의 기준 시각. 상반부가 찍은 값을 그대로 넘겨받는다.
+//   slow  잠들 수 있는 자리인가. 하반부(스레드)에서만 true 다.
+//         true 일 때만 pwm_apply_state 를 부를 수 있다.
+static void servo_estop_toggle(ktime_t t0, bool slow)
 {
-	const ktime_t t0 = ktime_get();
 	unsigned long flags;
 	bool engage;
 	int i;
@@ -576,20 +681,48 @@ static void servo_estop_toggle(void)
 			spin_lock_irqsave(&ch->lock, f);
 			ch->saved_us = ch->pulse_us;	/* 풀 때 되돌리려고 */
 			ch->pulse_us = 0;		/* ② 타이머가 스스로 종료 */
-			// PWM 모드에서는 핀 손잡이가 없다(핀이 PWM 회로에 붙어 있다).
-			// pwm_disable 은 잠들 수 있어 여기서 못 부른다 — 4단계에서
-			// 핀 기능 전환 / threaded IRQ 두 방법으로 해결한다.
 			if (ch->desc)
 				gpiod_set_value(ch->desc, 0);	/* ① 핀은 지금 당장 */
 			ch->level = false;
+			ch->running = false;
 			spin_unlock_irqrestore(&ch->lock, f);
+
+			// 하드웨어 PWM 을 멈추는 두 방법.
+			if (ch->pwm) {
+				if (slow) {
+					// 방법 thread — 정식 API. 잠들 수 있으므로
+					// ★ 자물쇠 밖에서, ★ 하반부에서만.
+					struct pwm_state st;
+
+					pwm_init_state(ch->pwm, &st);
+					st.duty_cycle = 0;
+					st.enabled = false;
+					pwm_apply_state(ch->pwm, &st);
+				} else {
+					// 방법 pinmux — 회로는 계속 돌고 출구만 막는다.
+					servo_pin_detach(ch->gpio);
+				}
+			}
 		} else {
 			unsigned int saved;
 
 			spin_lock_irqsave(&ch->lock, f);
 			saved = ch->saved_us;
 			spin_unlock_irqrestore(&ch->lock, f);
-			servo_set_pulse(ch, saved);	/* 원래 폭으로 복구 */
+
+			if (ch->pwm && !slow) {
+				// 방법 pinmux 의 해제 — duty 를 건드린 적이 없으니
+				// 핀만 되돌리면 그 순간 원래 펄스가 다시 나간다.
+				// servo_set_pulse 를 부르면 안 된다(잠들 수 있다).
+				spin_lock_irqsave(&ch->lock, f);
+				ch->pulse_us = saved;
+				ch->level = saved > 0;
+				ch->running = saved > 0;
+				spin_unlock_irqrestore(&ch->lock, f);
+				servo_pin_attach(ch->gpio);
+			} else {
+				servo_set_pulse(ch, saved);	/* 원래 폭으로 복구 */
+			}
 		}
 	}
 
@@ -603,11 +736,30 @@ static void servo_estop_toggle(void)
 			estop_max_ns = ns;
 		spin_unlock_irqrestore(&button_lock, flags);
 	}
+
+	// ★ 통계를 찍은 뒤에 LED 를 건드린다. 앞에 두면 불 켜는 시간이 비상정지
+	// 지연에 섞여 측정값이 오염된다.
+	//
+	// led_trigger_event 는 하드 IRQ 에서 불러도 된다 — 커널이 그 경우를
+	// 염두에 두고 필요하면 workqueue 로 미룬다(led-core.c 주석).
+	led_trigger_event(estop_led_trig, engage ? LED_FULL : LED_OFF);
+	led_trigger_event(run_led_trig,   engage ? LED_OFF  : LED_FULL);
 }
 
 // 하드웨어가 핀 변화를 보고 CPU 를 깨운다. 양쪽 엣지를 다 받는다 —
 // 떼는 것도 봐야 "이제 놓였구나" 를 알 수 있기 때문이다.
 // hrtimer 콜백과 같은 제약을 받는다: 잠들 수 없고, 짧아야 한다.
+// 하드웨어 PWM 을 쓰는 채널이 하나라도 있으면 하반부가 필요하다.
+static bool servo_estop_needs_thread(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(servo_ch); i++)
+		if (servo_ch[i].pwm)
+			return true;
+	return false;
+}
+
 static irqreturn_t servo_button_isr(int irq, void *dev_id)
 {
 	// 인터럽트를 받은 시각. 이후 모든 지연 측정의 기준점이다.
@@ -635,18 +787,38 @@ static irqreturn_t servo_button_isr(int irq, void *dev_id)
 	spin_unlock_irqrestore(&button_lock, flags);
 
 	if (accepted) {
-		// D — 유저를 거치지 않고 여기서 바로 멈춘다.
-		// pigpio 였다면 불가능했다(펄스를 유저 프로세스가 만드니까).
-		// 하드웨어 PWM 이었어도 불가능했다(pwm_disable 이 might_sleep).
-		if (READ_ONCE(estop_mode) == ESTOP_MODE_KERNEL)
-			servo_estop_toggle();
-
 		// wake_up 계열은 인터럽트 문맥에서 불러도 된다 (잠들지 않는다).
 		// 알림은 첫 엣지에 곧바로 한다 — 안정될 때까지 기다렸다 알리면
 		// 지연이 20ms 가 되어 인터럽트를 쓴 의미가 사라진다.
 		wake_up_interruptible(&button_wq);
+
+		if (READ_ONCE(estop_mode) == ESTOP_MODE_KERNEL) {
+			// 하드웨어 PWM 채널이 있으면 여기서는 못 끈다.
+			// pwm_apply_state 가 잠들 수 있기 때문이다 — 하반부로 넘긴다.
+			if (servo_estop_needs_thread() &&
+			    READ_ONCE(estop_method) == ESTOP_METHOD_THREAD) {
+				estop_req_ts = now;
+				WRITE_ONCE(estop_path, ESTOP_PATH_THREAD);
+				return IRQ_WAKE_THREAD;
+			}
+
+			// GPIO 모드: 핀을 내리는 것뿐이라 여기서 끝낸다 (D 와 동일).
+			WRITE_ONCE(estop_path, ESTOP_PATH_IRQ);
+			servo_estop_toggle(now, false);
+		}
 	}
 
+	return IRQ_HANDLED;
+}
+
+// 하반부 — 커널 스레드(ps 에 irq/NN-servo-button 으로 보인다)에서 실행된다.
+// 여기는 잠들어도 되는 문맥이라 정식 PWM API 를 그대로 쓸 수 있다.
+//
+// 대가는 지연이다. 상반부가 IRQ_WAKE_THREAD 를 돌려준 뒤 스케줄러가 이 스레드를
+// 깨워야 하고, 그 시간이 estop_req_ts 기준으로 통계에 잡힌다.
+static irqreturn_t servo_button_thread(int irq, void *dev_id)
+{
+	servo_estop_toggle(estop_req_ts, true);
 	return IRQ_HANDLED;
 }
 
@@ -692,9 +864,12 @@ static int servo_button_setup(void)
 	// 양쪽 엣지를 다 받는다. 누름만 받으면, 깔끔하게 떼었을 때 엣지가 하나도
 	// 안 와서 잠금이 영영 안 풀린다.
 	// IRQF_TRIGGER_BOTH 라는 상수는 없다. 둘을 OR 로 묶는 게 양쪽 엣지다.
-	ret = request_irq(button_irq, servo_button_isr,
-			  IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
-			  "servo-button", NULL);
+	// 상반부와 하반부를 함께 등록한다. 하반부가 필요 없는 경우(GPIO 모드)에는
+	// 상반부가 IRQ_HANDLED 로 끝내므로 스레드는 깨지 않는다 — 공짜다.
+	ret = request_threaded_irq(button_irq, servo_button_isr,
+				   servo_button_thread,
+				   IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+				   "servo-button", NULL);
 	if (ret) {
 		pr_err("IRQ %d 등록 실패 (%d)\n", button_irq, ret);
 		goto err_free;
@@ -942,6 +1117,7 @@ static ssize_t estop_show(struct device *dev, struct device_attribute *attr,
 {
 	unsigned long flags;
 	u64 count, sum, max, avg;
+	const char *path;
 	bool engaged;
 	int mode;
 
@@ -956,10 +1132,20 @@ static ssize_t estop_show(struct device *dev, struct device_attribute *attr,
 
 	avg = count ? sum / count : 0;
 
+	switch (READ_ONCE(estop_path)) {
+	case ESTOP_PATH_IRQ:	path = "irq";    break;
+	case ESTOP_PATH_THREAD:	path = "thread"; break;
+	default:		path = "-";      break;
+	}
+
 	return scnprintf(buf, PAGE_SIZE,
-			 "mode %s  engaged %d  stops %llu  avg %llu.%01lluus  max %llu.%01lluus\n"
-			 "핸들러 안에서 두 핀을 LOW 로 내리는 데 걸린 시간이다.\n",
+			 "mode %s  method %s  path %s  engaged %d  stops %llu  avg %llu.%01lluus  max %llu.%01lluus\n"
+			 "버튼 인터럽트를 받은 시각부터 실제로 펄스가 끊길 때까지다.\n"
+			 "method thread = 하반부에서 pwm_apply_state 로 PWM 을 끈다 (정식)\n"
+			 "method pinmux = 상반부에서 GPFSEL 을 직접 써 핀을 PWM 에서 뗀다 (우회)\n",
 			 mode == ESTOP_MODE_KERNEL ? "kernel" : "user",
+			 READ_ONCE(estop_method) == ESTOP_METHOD_PINMUX ? "pinmux" : "thread",
+			 path,
 			 engaged ? 1 : 0, count,
 			 avg / 1000, (avg % 1000) / 100,
 			 max / 1000, (max % 1000) / 100);
@@ -973,7 +1159,11 @@ static ssize_t estop_store(struct device *dev, struct device_attribute *attr,
 	if (sscanf(buf, "%15s", word) != 1)
 		return -EINVAL;
 
-	if (!strcmp(word, "kernel")) {
+	if (!strcmp(word, "thread")) {
+		WRITE_ONCE(estop_method, ESTOP_METHOD_THREAD);
+	} else if (!strcmp(word, "pinmux")) {
+		WRITE_ONCE(estop_method, ESTOP_METHOD_PINMUX);
+	} else if (!strcmp(word, "kernel")) {
 		WRITE_ONCE(estop_mode, ESTOP_MODE_KERNEL);
 	} else if (!strcmp(word, "user")) {
 		WRITE_ONCE(estop_mode, ESTOP_MODE_USER);
@@ -992,7 +1182,7 @@ static ssize_t estop_store(struct device *dev, struct device_attribute *attr,
 		for (i = 0; i < ARRAY_SIZE(servo_ch); i++)
 			servo_set_pulse(&servo_ch[i], 0);
 	} else {
-		pr_warn("estop: kernel | user | clear 중 하나여야 합니다 (\"%s\")\n",
+		pr_warn("estop: kernel | user | thread | pinmux | clear 중 하나여야 합니다 (\"%s\")\n",
 			word);
 		return -EINVAL;
 	}
@@ -1074,6 +1264,13 @@ static const struct file_operations servo_fops = {
 static int servo_channel_setup(struct servo_channel *ch)
 {
 	int ret;
+
+	// 핀을 건드리기 전에 원래 기능을 적어 둔다. gpio_request 도 estop 의
+	// pinmux 도 이 값을 바꾸므로, 순서상 여기가 유일하게 맞는 자리다.
+	if (gpio_regs) {
+		ch->saved_fsel = servo_pin_get_func(ch->gpio);
+		ch->fsel_saved = true;
+	}
 
 	spin_lock_init(&ch->lock);
 	ch->pulse_us = 0;
@@ -1225,6 +1422,11 @@ static int __init servo_init(void)
 {
 	int ret, i;
 
+	// (0-a) LED 트리거를 먼저 등록한다. 등록만 해두면 유저가 언제든
+	//       /sys/class/leds/<이름>/trigger 로 붙였다 뗐다 할 수 있다.
+	led_trigger_register_simple("servo-estop", &estop_led_trig);
+	led_trigger_register_simple("servo-run", &run_led_trig);
+
 	// (0) 디바이스 트리에 /servo 노드가 있으면 여기서 probe 가 불려 PWM 을
 	//     받아 둔다. 채널 준비보다 먼저 해야 한다 — 핀을 GPIO 로 잡을지
 	//     PWM 에 둘지가 이 결과에 달려 있기 때문이다.
@@ -1232,6 +1434,20 @@ static int __init servo_init(void)
 	if (ret) {
 		pr_err("platform driver 등록 실패 (%d)\n", ret);
 		return ret;
+	}
+
+	// (0-b) 방법 pinmux 에서 쓸 GPIO 레지스터를 매핑해 둔다. 주소는 DT 에서
+	//       받아 온다. 실패해도 방법 thread 는 쓸 수 있으므로 경고만 남긴다.
+	{
+		struct device_node *np;
+
+		np = of_find_compatible_node(NULL, NULL, "brcm,bcm2711-gpio");
+		if (np) {
+			gpio_regs = of_iomap(np, 0);
+			of_node_put(np);
+		}
+		if (!gpio_regs)
+			pr_warn("GPIO 레지스터를 매핑하지 못했습니다 — estop pinmux 방법을 쓸 수 없습니다\n");
 	}
 
 	// (1) 핀과 타이머를 준비한다. PWM 을 받은 채널은 건너뛴다.
@@ -1342,6 +1558,10 @@ static void __exit servo_exit(void)
 	// 새 요청이 들어올 길부터 끊는다. probe/remove 가 도는 중이면 끝나길 기다린다.
 	platform_driver_unregister(&servo_pdrv);
 
+	// 트리거를 없애면 붙어 있던 LED 들은 자동으로 "none" 으로 돌아간다.
+	led_trigger_unregister_simple(run_led_trig);
+	led_trigger_unregister_simple(estop_led_trig);
+
 	device_remove_file(servo_device, &dev_attr_estop);
 	device_remove_file(servo_device, &dev_attr_level);
 	device_remove_file(servo_device, &dev_attr_press);
@@ -1359,6 +1579,21 @@ static void __exit servo_exit(void)
 
 	for (i = ARRAY_SIZE(servo_ch) - 1; i >= 0; i--)
 		servo_channel_teardown(&servo_ch[i]);
+
+	// 핀을 적재 전 상태로 되돌려 놓고 나간다.
+	//
+	// gpio_request 는 핀 기능을 GPIO 로 바꾸지만 gpio_free 는 되돌려 주지
+	// 않는다(실측). 그대로 두면 다음에 올라온 드라이버가 PWM 파형을 만들어도
+	// 핀 밖으로 나가지 않는다 — 2026-09-28 에 이것 때문에 raspi-gpio 로
+	// 손수 되돌려야 했다. 그래서 우리가 기록해 두고 우리가 되돌린다.
+	if (gpio_regs) {
+		for (i = 0; i < ARRAY_SIZE(servo_ch); i++)
+			if (servo_ch[i].fsel_saved)
+				servo_pin_set_func(servo_ch[i].gpio,
+						   servo_ch[i].saved_fsel);
+		iounmap(gpio_regs);
+		gpio_regs = NULL;
+	}
 
 	pr_info("제거됨\n");
 }
