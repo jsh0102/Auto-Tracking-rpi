@@ -22,6 +22,7 @@ auto.key
 
 # 커널 모듈 빌드 산출물
 *.ko
+*.dtbo
 *.mod
 *.mod.c
 *.symvers

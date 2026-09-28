@@ -43,7 +43,10 @@
 #include <linux/kstrtox.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pinctrl/pinconf-generic.h>
+#include <linux/platform_device.h>
+#include <linux/pwm.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -178,6 +181,11 @@ struct servo_channel {
 	u64 jit_bucket[SERVO_JIT_BUCKETS];
 
 	unsigned int saved_us;		/* 비상정지 직전의 펄스폭. 풀 때 되돌린다 */
+
+	/* 디바이스 트리(servo-pwm 오버레이)에서 받아온 하드웨어 PWM 채널.
+	 * 오버레이가 없거나 probe 가 불리지 않으면 NULL 이고, 그때는 아래의
+	 * hrtimer 가 지금까지처럼 펄스를 만든다. */
+	struct pwm_device *pwm;
 };
 
 static struct servo_channel servo_ch[] = {
@@ -364,6 +372,37 @@ static void servo_set_pulse(struct servo_channel *ch, unsigned int pulse_us)
 	unsigned long flags;
 	bool need_start;
 
+	// 하드웨어 PWM 을 받았으면 duty 만 갈아끼운다. 파형은 칩이 유지하므로
+	// CPU 가 관여하지 않고, 부하가 걸려도 펄스폭이 흔들리지 않는다.
+	// pwm_apply_state 는 잠들 수 있지만 여기는 write() 문맥이라 괜찮다.
+	if (ch->pwm) {
+		struct pwm_state state;
+		int ret;
+
+		// DT 에 적은 주기(20ms)가 pwm->args 에 들어 있고, init_state 가
+		// 그 값으로 채워 준다. 우리는 duty 만 정하면 된다.
+		pwm_init_state(ch->pwm, &state);
+		state.duty_cycle = (u64)pulse_us * NSEC_PER_USEC;
+		state.enabled = pulse_us > 0;
+
+		ret = pwm_apply_state(ch->pwm, &state);
+		if (ret) {
+			pr_warn("%s: PWM 적용 실패 (%d)\n", ch->name, ret);
+			return;
+		}
+
+		// 상태 표시(cat /dev/servo0)와 비상정지 복구에 쓰는 값.
+		// running 은 "펄스가 나가는 중" 이라는 뜻이다. hrtimer 모드에서는
+		// 타이머가 도는지를 가리켰고, PWM 모드에서는 칩이 파형을 내보내는
+		// 중인지를 가리킨다. 둘 다 같은 질문이라 같은 칸을 쓴다.
+		spin_lock_irqsave(&ch->lock, flags);
+		ch->pulse_us = pulse_us;
+		ch->level = pulse_us > 0;
+		ch->running = pulse_us > 0;
+		spin_unlock_irqrestore(&ch->lock, flags);
+		return;
+	}
+
 	spin_lock_irqsave(&ch->lock, flags);
 	ch->pulse_us = pulse_us;
 	// 이미 돌고 있으면 값만 갈아끼운다. 타이머를 건드리지 않으므로
@@ -537,7 +576,11 @@ static void servo_estop_toggle(void)
 			spin_lock_irqsave(&ch->lock, f);
 			ch->saved_us = ch->pulse_us;	/* 풀 때 되돌리려고 */
 			ch->pulse_us = 0;		/* ② 타이머가 스스로 종료 */
-			gpiod_set_value(ch->desc, 0);	/* ① 핀은 지금 당장 */
+			// PWM 모드에서는 핀 손잡이가 없다(핀이 PWM 회로에 붙어 있다).
+			// pwm_disable 은 잠들 수 있어 여기서 못 부른다 — 4단계에서
+			// 핀 기능 전환 / threaded IRQ 두 방법으로 해결한다.
+			if (ch->desc)
+				gpiod_set_value(ch->desc, 0);	/* ① 핀은 지금 당장 */
 			ch->level = false;
 			spin_unlock_irqrestore(&ch->lock, f);
 		} else {
@@ -1032,6 +1075,19 @@ static int servo_channel_setup(struct servo_channel *ch)
 {
 	int ret;
 
+	spin_lock_init(&ch->lock);
+	ch->pulse_us = 0;
+	ch->level = false;
+	ch->running = false;
+
+	// 하드웨어 PWM 을 받았으면 핀을 GPIO 로 잡으면 안 된다.
+	// gpiod_get 은 거절당하지 않고 오히려 핀 기능을 ALT0(PWM) 에서 GPIO 로
+	// 되돌려 버린다 — 그러면 PWM 파형이 핀까지 가지 못한다. (실측으로 확인)
+	if (ch->pwm) {
+		pr_info("%s: 하드웨어 PWM 사용 — 핀은 PWM 회로에 둔다\n", ch->name);
+		return 0;
+	}
+
 	ret = gpio_request_one(ch->gpio, GPIOF_OUT_INIT_LOW, ch->label);
 	if (ret) {
 		// -EBUSY(-16) 면 다른 드라이버가 이미 쓰고 있다는 뜻이다.
@@ -1046,11 +1102,6 @@ static int servo_channel_setup(struct servo_channel *ch)
 		gpio_free(ch->gpio);
 		return -ENODEV;
 	}
-
-	spin_lock_init(&ch->lock);
-	ch->pulse_us = 0;
-	ch->level = false;
-	ch->running = false;
 
 	// CLOCK_MONOTONIC: 시스템 시간이 바뀌어도 흔들리지 않는 시계.
 	// 사용자가 날짜를 고쳐도 펄스가 튀면 안 된다.
@@ -1070,6 +1121,9 @@ static int servo_channel_setup(struct servo_channel *ch)
 // 기다리지 않고 모듈을 지우면, 사라진 코드를 실행 중인 CPU 가 커널을 죽인다.
 static void servo_channel_teardown(struct servo_channel *ch)
 {
+	// PWM 모드에서는 잡은 핀도 건 타이머도 없다. 펄스 중단은 servo_remove()
+	// 가 이미 했다 — 여기서 ch->pwm 을 쓰면 안 된다. 그 시점엔 platform
+	// 드라이버가 먼저 내려가 devm 이 PWM 을 반납한 뒤다.
 	if (!ch->desc)
 		return;
 
@@ -1081,11 +1135,106 @@ static void servo_channel_teardown(struct servo_channel *ch)
 
 // 커널 코드의 정리 방식: 성공한 것만 거꾸로 되돌린다.
 // 유저 프로그램은 죽으면 OS 가 회수해 주지만, 커널은 회수해 줄 상위 존재가 없다.
+// ── 디바이스 트리에 붙기 ────────────────────────────────────────
+//
+// 지금까지 이 모듈은 insmod 하면 무조건 실행되는 구조였다. 여기서부터는
+// "장치가 있으면 커널이 드라이버를 불러 주는" 정상적인 형태를 함께 갖춘다.
+//
+//   servo-pwm.dtbo 가 /servo 노드를 만든다  →  커널이 compatible 을 보고
+//   이 드라이버를 찾는다  →  servo_probe() 가 불린다  →  PWM 채널을 받는다
+//
+// pwm_add_table() 로 코드에서 등록하는 길도 있으나 그 함수는 EXPORT 되어
+// 있지 않아 모듈에서 쓸 수 없다. 디바이스 트리가 정식 경로다.
+
+static const struct of_device_id servo_of_match[] = {
+	{ .compatible = "jsh,servo-pwm" },	/* 오버레이에 적은 이름과 같아야 한다 */
+	{ }
+};
+MODULE_DEVICE_TABLE(of, servo_of_match);
+
+static int servo_probe(struct platform_device *pdev)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(servo_ch); i++) {
+		struct servo_channel *ch = &servo_ch[i];
+		struct pwm_state state;
+		struct pwm_device *pwm;
+
+		// 이름은 오버레이의 pwm-names 와 같다 ("pan", "tilt").
+		// devm_ 이 붙었으므로 장치가 사라질 때 커널이 알아서 반납한다.
+		pwm = devm_pwm_get(&pdev->dev, ch->name);
+		if (IS_ERR(pwm)) {
+			int err = PTR_ERR(pwm);
+
+			// -EPROBE_DEFER 는 오류가 아니다. PWM 칩 드라이버가 아직
+			// 안 올라온 것이고, 커널이 나중에 다시 부른다.
+			if (err != -EPROBE_DEFER)
+				dev_err(&pdev->dev, "%s: PWM 을 받지 못했습니다 (%d)\n",
+					ch->name, err);
+			return err;
+		}
+
+		ch->pwm = pwm;
+		pwm_get_state(pwm, &state);
+		dev_info(&pdev->dev, "%s: PWM 확보 — 주기 %lluns, duty %lluns, %s\n",
+			 ch->name, state.period, state.duty_cycle,
+			 state.enabled ? "켜짐" : "꺼짐");
+	}
+
+	// 아직 쓰지는 않는다. 펄스는 여전히 hrtimer 가 만든다.
+	dev_info(&pdev->dev, "PWM %zu채널 확보 (펄스 생성은 아직 hrtimer)\n",
+		 ARRAY_SIZE(servo_ch));
+	return 0;
+}
+
+static int servo_remove(struct platform_device *pdev)
+{
+	int i;
+
+	// 반납(devm) 전에 펄스부터 끊는다. 안 그러면 모듈이 사라진 뒤에도
+	// 칩이 마지막 duty 로 파형을 계속 내보낸다 — 서보가 힘을 준 채 남는다.
+	for (i = 0; i < ARRAY_SIZE(servo_ch); i++) {
+		struct servo_channel *ch = &servo_ch[i];
+		struct pwm_state state;
+
+		if (!ch->pwm)
+			continue;
+
+		pwm_init_state(ch->pwm, &state);
+		state.duty_cycle = 0;
+		state.enabled = false;
+		pwm_apply_state(ch->pwm, &state);
+
+		ch->pwm = NULL;		/* 해제된 포인터를 남기지 않는다 */
+	}
+
+	return 0;
+}
+
+static struct platform_driver servo_pdrv = {
+	.driver = {
+		.name = "servo-pwm",
+		.of_match_table = servo_of_match,
+	},
+	.probe = servo_probe,
+	.remove = servo_remove,
+};
+
 static int __init servo_init(void)
 {
 	int ret, i;
 
-	// (1) 핀과 타이머를 먼저 준비한다. 없으면 /dev/servo0 을 만들 이유가 없다.
+	// (0) 디바이스 트리에 /servo 노드가 있으면 여기서 probe 가 불려 PWM 을
+	//     받아 둔다. 채널 준비보다 먼저 해야 한다 — 핀을 GPIO 로 잡을지
+	//     PWM 에 둘지가 이 결과에 달려 있기 때문이다.
+	ret = platform_driver_register(&servo_pdrv);
+	if (ret) {
+		pr_err("platform driver 등록 실패 (%d)\n", ret);
+		return ret;
+	}
+
+	// (1) 핀과 타이머를 준비한다. PWM 을 받은 채널은 건너뛴다.
 	for (i = 0; i < ARRAY_SIZE(servo_ch); i++) {
 		ret = servo_channel_setup(&servo_ch[i]);
 		if (ret)
@@ -1177,6 +1326,7 @@ err_channel:
 	// i 번째에서 실패했으므로 0 .. i-1 까지만 돌려준다.
 	while (--i >= 0)
 		servo_channel_teardown(&servo_ch[i]);
+	platform_driver_unregister(&servo_pdrv);
 	return ret;
 }
 
@@ -1188,6 +1338,9 @@ err_channel:
 static void __exit servo_exit(void)
 {
 	int i;
+
+	// 새 요청이 들어올 길부터 끊는다. probe/remove 가 도는 중이면 끝나길 기다린다.
+	platform_driver_unregister(&servo_pdrv);
 
 	device_remove_file(servo_device, &dev_attr_estop);
 	device_remove_file(servo_device, &dev_attr_level);
@@ -1209,6 +1362,7 @@ static void __exit servo_exit(void)
 
 	pr_info("제거됨\n");
 }
+
 
 module_init(servo_init);
 module_exit(servo_exit);

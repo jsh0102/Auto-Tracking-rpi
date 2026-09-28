@@ -1,0 +1,45 @@
+/*
+ * servo-pwm — 커널 서보 드라이버가 하드웨어 PWM 채널을 받아오기 위한 오버레이.
+ *
+ * 왜 필요한가:
+ *   커널 안에서 PWM 을 쓰려면 "이 장치가 이 채널을 쓴다" 가 디바이스 트리에
+ *   적혀 있어야 pwm_get() 이 된다. 코드에서 등록하는 방법(pwm_add_table)은
+ *   EXPORT 되어 있지 않아 모듈에서 쓸 수 없다. 그래서 여기에 선언한다.
+ *
+ * pwm-2chan 오버레이와 함께 쓴다 (빼면 안 된다):
+ *   pwm-2chan   핀을 PWM 회로에 연결(ALT0) + pwm 노드 켜기 + 클럭 설정
+ *   이 파일      "servo 장치가 그 PWM 채널 0·1 번을 쓴다" 는 선언
+ *
+ * 빌드와 설치:
+ *   dtc -@ -I dts -O dtb -o servo-pwm.dtbo servo-pwm.dts
+ *   sudo cp servo-pwm.dtbo /boot/overlays/
+ *   config.txt 에  dtoverlay=servo-pwm  추가 후 재부팅
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		/* 루트 아래에 장치 노드를 하나 만든다.
+		   pwm-ir-tx 등 기존 소비자 오버레이와 같은 방식이다. */
+		target-path = "/";
+
+		__overlay__ {
+			servo: servo {
+				/* servo.ko 가 이 이름으로 찾아 붙는다 (of_device_id) */
+				compatible = "jsh,servo-pwm";
+
+				/* 이 칩의 #pwm-cells 는 2 -> <채널번호, 주기(ns)>
+				   20000000ns = 20ms = 50Hz.
+				   servo.c 의 SERVO_PERIOD_US(20000) 과 같은 값이어야 한다. */
+				pwms = <&pwm 0 20000000>, <&pwm 1 20000000>;
+				pwm-names = "pan", "tilt";
+
+				status = "okay";
+			};
+		};
+	};
+};
