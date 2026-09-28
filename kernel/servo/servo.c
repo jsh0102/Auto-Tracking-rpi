@@ -1373,6 +1373,20 @@ static int servo_probe(struct platform_device *pdev)
 		}
 
 		ch->pwm = pwm;
+
+		// 부팅할 때는 이 모듈이 PWM 칩 드라이버보다 먼저 올라올 수 있다.
+		// 그러면 채널 준비 시점에 PWM 이 없어 hrtimer 모드로 세팅되고, probe 는
+		// 한참 뒤에 불린다(실측 1.8초). 그 경우 여기서 되돌린다 —
+		// 순서가 어떻든 같은 상태로 끝나게 하려는 것이다.
+		if (ch->desc) {
+			hrtimer_cancel(&ch->timer);	/* 아직 안 돌지만 확실히 */
+			gpio_free(ch->gpio);
+			ch->desc = NULL;
+			servo_pin_attach(ch->gpio);	/* 핀을 PWM 회로로 되돌린다 */
+			dev_info(&pdev->dev, "%s: 늦게 받은 PWM — GPIO 를 반납하고 전환\n",
+				 ch->name);
+		}
+
 		pwm_get_state(pwm, &state);
 		dev_info(&pdev->dev, "%s: PWM 확보 — 주기 %lluns, duty %lluns, %s\n",
 			 ch->name, state.period, state.duty_cycle,
