@@ -11,6 +11,9 @@
 | 사람 검출 | 동작 확인됨 (MobileNet-SSD, 약 4~6 fps) |
 | 추적 (PID) | 동작 확인됨. 중앙 수렴까지 약간 출렁임 — 튜닝 여지 있음 |
 | 서보 제어 | 동작 확인됨 (MG90 ×2, 가동범위 ±90도 실측) |
+| 커널 서보 드라이버 | 동작 확인됨 — `/dev/servo0`, 하드웨어 PWM. pigpio 를 대체 |
+| 비상정지 버튼 | 동작 확인됨 — 커널이 직접 정지. 정지 중 모든 명령 거부 |
+| 상태 표시 LED | 동작 확인됨 — 커널이 트리거 발행, 유저가 LED 를 연결 |
 
 ## 동작 구조
 
@@ -24,11 +27,21 @@
    │                                          │
    │                    박스 좌표 ◄───────────┤
    ▼                                          ▼
- ffmpeg (h264_v4l2m2m)              PID -> pigpiod -> MG90 x2
-   │  인코딩만. 디코딩 없음.
-   ▼
- MediaMTX :8554 ──→ 시청자
+ ffmpeg (h264_v4l2m2m)                       PID
+   │  인코딩만. 디코딩 없음.                     │  "pan 1683us"
+   ▼                                             ▼
+ MediaMTX :8554 ──→ 시청자              /dev/servo0
+                                               │
+                                        [ 커널 모듈 servo.ko ]
+                                               │  pwm_apply_state
+                                        [ 칩의 PWM 회로 ] ──→ MG90 x2
+                                               ▲
+                                        버튼 GPIO17 ─ IRQ ─┘  비상정지
 ```
+
+**펄스는 칩이 만든다.** 커널 모듈은 duty 값을 바꿀 뿐이고 CPU 는 파형에 관여하지
+않는다. 그래서 부하가 걸려도 펄스폭이 흔들리지 않는다(hrtimer 로 만들 때는 부하 시
+최대 11도까지 튀었다 — `docs/measurements/jitter.md`).
 
 libcamera C++ API 로 카메라를 직접 연다. ISP 가 두 해상도를 하드웨어로 동시에
 출력하므로 소프트웨어 축소가 없고, 검출용 프레임은 압축을 거치지 않는다.
@@ -110,6 +123,80 @@ GPIO12/13 을 고른 건 나란히 붙어 있고 GND 가 가까워서다.
 - `pigpiod` 데몬이 떠 있어야 한다: `sudo systemctl enable --now pigpiod`.
   없으면 경고를 찍고 모터만 비활성화된 채로 계속 동작한다(송출은 살아 있다).
 
+## 커널 서보 드라이버
+
+서보 펄스를 커널에서 만든다. 유저스페이스는 `/dev/servo0` 에 한 줄 쓰는 게 전부다.
+
+```bash
+echo "pan 1500"   > /dev/servo0    # 펄스폭(µs) — 기본 단위
+echo "pan 30deg"  > /dev/servo0    # 정수 각도 (커널이 환산)
+echo "pan off"    > /dev/servo0    # 펄스 중단 — 서보가 힘을 놓는다
+cat /dev/servo0                    # 현재 상태
+```
+
+`config.json` 의 `motor.backend` 를 `kservo` 로 두면 `camtracker` 가 이 경로를 쓴다.
+
+### 준비
+
+`/boot/config.txt` 에 세 줄이 필요하다. 오디오는 PWM 채널을 다투므로 꺼야 한다.
+
+```
+#dtparam=audio=on
+dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4   핀을 PWM 회로에 붙인다
+dtoverlay=servo-pwm                                  "servo 장치가 그 채널을 쓴다"
+dtoverlay=servo-led                                  GPIO27 에 LED 가 있다
+```
+
+```bash
+make -C kernel/servo                                 # servo.ko
+dtc -@ -I dts -O dtb -o kernel/servo/servo-pwm.dtbo kernel/servo/servo-pwm.dts
+sudo cp kernel/servo/*.dtbo /boot/overlays/
+sudo cp kernel/servo/99-servo.rules /etc/udev/rules.d/    # gpio 그룹에 권한
+sudo insmod kernel/servo/servo.ko
+```
+
+오버레이가 없으면 모듈은 hrtimer 로 펄스를 만드는 예전 경로로 돌아간다. 두 경로를
+남겨 둔 이유는 비교 측정 때문이다.
+
+### 비상정지
+
+버튼(GPIO17)을 누르면 커널이 직접 서보를 멈춘다. **유저 프로그램이 하나도 떠 있지
+않아도 동작한다.** 그리고 정지 중에는 `/dev/servo0` 에 오는 모든 명령이 거부된다
+(`EBUSY`) — 서보로 가는 길이 하나뿐이라 커널이 문지기가 된다.
+
+```bash
+cat /sys/class/servo/servo0/estop
+# mode kernel  method thread  path thread  engaged 0  stops 6  avg 45.7us  max 61.1us
+
+echo pinmux > /sys/class/servo/servo0/estop   # 상반부에서 핀을 PWM 에서 뗀다   8.0µs
+echo thread > /sys/class/servo/servo0/estop   # 하반부에서 정식 API 로 끈다    45.7µs (기본)
+echo clear  > /sys/class/servo/servo0/estop   # 정지 해제 + 통계 초기화
+```
+
+두 방법의 측정과 선택 근거는 `docs/measurements/button_latency.md` 에 있다.
+
+### 상태 표시 LED
+
+드라이버는 "정지 중 / 동작 중" 이라는 **사실만 발행**하고, 어느 불로 보여줄지는
+밖에서 정한다.
+
+```bash
+echo servo-estop > /sys/class/leds/estop/trigger    # 빨강은 정지를 따른다
+echo servo-run   > /sys/class/leds/green/trigger    # 초록은 동작을 따른다
+```
+
+LED 를 늘리거나 핀을 옮겨도 드라이버 코드는 그대로다. LED 추가는
+`kernel/servo/servo-led.dts` 에 블록 하나를 복사하면 된다.
+
+### 상태 파일
+
+| 경로 | 내용 |
+|------|------|
+| `/sys/class/servo/servo0/estop` | 비상정지 상태·방법·지연 통계 |
+| `/sys/class/servo/servo0/button` | 버튼 인터럽트·채터링 통계 |
+| `/sys/class/servo/servo0/jitter` | hrtimer 경로의 타이머 지터 (PWM 경로에서는 무의미) |
+| `/dev/button0` | 버튼이 눌릴 때까지 잠드는 `read()` |
+
 ## 설정 (`config.json`)
 
 전체 기본값은 `./build/camtracker --dump-config` 로 확인.
@@ -153,23 +240,40 @@ GPIO12/13 을 고른 건 나란히 붙어 있고 GND 가 가까워서다.
 journalctl -fu camtracker
 ```
 
+커널 모듈도 부팅할 때 올리려면:
+
+```bash
+sudo mkdir -p /lib/modules/$(uname -r)/extra
+sudo cp kernel/servo/servo.ko /lib/modules/$(uname -r)/extra/
+sudo depmod -a
+echo servo | sudo tee /etc/modules-load.d/servo.conf
+```
+
+`depmod` 를 빼먹으면 `modprobe` 가 모듈을 찾지 못한다.
+
 ## 코드 구성
 
 | 파일 | 역할 |
 |------|------|
 | `src/camera.cpp` | libcamera 직접 제어, 듀얼 스트림, 박스 오버레이, 인코더 파이프 |
 | `src/detector.cpp` | `Detector` 인터페이스, MobileNet-SSD, 타겟 선택 |
-| `src/motor.cpp` | `PanTilt` 인터페이스, pigpiod 서보 구현, dummy |
+| `src/motor.cpp` | `PanTilt` 인터페이스 — `servo`(pigpio) / `kservo`(커널) / `syspwm` / dummy |
 | `src/tracker.cpp` | PID, 화면 오차 → 각도 변화량, 소실 시 홈 복귀 |
 | `src/app.cpp` | 메인 루프, 통계, 디버그 오버레이 |
 | `src/config.cpp` | 기본값 + JSON 덮어쓰기, 알 수 없는 키 거부 |
 | `src/log.cpp` | 작은 printf 로거 |
+| `kernel/servo/servo.c` | 커널 모듈 — 캐릭터 디바이스, 하드웨어 PWM, 버튼 IRQ, LED 트리거 |
+| `kernel/servo/*.dts` | 디바이스 트리 오버레이 — PWM 채널 선언, LED 등록 |
 
 각 계층은 인터페이스로 분리돼 있어 교체가 쉽다.
 예: `detector.cpp` 에 YOLO 백엔드를 추가하고 `makeDetector` 에 한 줄 넣으면 끝.
 
 ## 할 일
 
+- **근거리에서 tilt 가 튄다** — 사람이 프레임보다 크면 검출 박스가 위아래로 잘리고,
+  잘린 박스의 중심은 카메라가 어디를 보든 화면 중앙이라 세로 오차가 0 으로 고정된다.
+  간헐적 부분 검출이 겹치면 제어기가 한 방향으로 20도를 몰아간다. 원인은 규명했고
+  근본 해결(거리·화각 또는 검출 개선)은 남아 있다 — `docs/measurements/tracking.md`.
 - **in-process 인코딩** — 지금은 raw YUV420 을 파이프로 ffmpeg 에 넘긴다(41MB/s).
   libavcodec 으로 직접 인코딩하면 이 파이프와, 콜백에서의 프레임 복사가 모두
   사라진다. 측정상 복사 1.53% + 파이프분 → 3~5%p 정도의 이득이 예상된다.
