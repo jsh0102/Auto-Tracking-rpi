@@ -1,4 +1,7 @@
-// 2-1: libcamera 로 직접 프레임 한 장 받아 JPEG 으로 저장한다.
+// grab_one — libcamera 로 직접 프레임 한 장 받아 JPEG 으로 저장한다.
+// camera.cpp 의 직접 제어 구조를 만들기 전에 최소 경로를 확인한 예제다.
+//
+//   g++ -std=c++17 tools/grab_one.cpp -o tools/grab_one \n//       $(pkg-config --cflags --libs libcamera opencv4)
 //
 // libcamera-vid 도 ffmpeg 도 쓰지 않는다. 카메라를 우리가 직접 연다.
 // 순서는 항상 이렇다:

@@ -38,8 +38,8 @@ public:
 
 // cfg.motor.backend
 //   servo   pigpiod 를 통해 제어 (유저스페이스에서 PWM 생성)
-//   kservo  /dev/servo0 에 써서 제어 (커널 모듈이 hrtimer 로 PWM 생성)
-//   syspwm  /sys/class/pwm 에 써서 제어 (칩의 하드웨어 PWM 회로가 생성)
+//   kservo  /dev/servo0 에 써서 제어 (커널 모듈 — 하드웨어 PWM, 오버레이 없으면 hrtimer)
+//   syspwm  /sys/class/pwm 에 써서 제어 (하드웨어 PWM, 커널 모듈 없이. 비교용)
 //   dummy   아무것도 하지 않음
 //
 // servo/kservo/syspwm 인데 장치를 잡지 못하면 경고를 찍고 dummy 로 내려간다 —

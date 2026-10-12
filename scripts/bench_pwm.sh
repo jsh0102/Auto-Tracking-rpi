@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # PWM 생성 방식별 CPU 사용률 비교 — pigpio(DMA) vs 커널 모듈(hrtimer)
+# 결과: docs/measurements/cpu.md
+#
+# ★ cpu.md 와 같은 조건이려면 커널 모듈이 hrtimer 경로로 돌아야 한다.
+#   /boot/config.txt 에 dtoverlay=servo-pwm 이 있으면 모듈이 하드웨어 PWM 을
+#   쓰므로 ③ 은 하드웨어 PWM 의 값이 된다.
 #
 #   sudo ./scripts/bench_pwm.sh          기본 60초씩
 #   sudo SECS=120 ./scripts/bench_pwm.sh 더 길게

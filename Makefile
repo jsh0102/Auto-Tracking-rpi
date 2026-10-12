@@ -12,8 +12,8 @@ CXX      ?= g++
 CXXFLAGS += -std=c++17 -Wall -Wextra -O2 -MMD -MP -Isrc -Ithird_party
 CXXFLAGS += $(shell pkg-config --cflags $(PKGS))
 
-# opencv4 는 pkg-config 가 전체 모듈을 뱉어낸다. 실제로 쓰는 건 core/imgproc/
-# imgcodecs/dnn 넷뿐이라 직접 적어 링크 시간과 의존성을 줄인다.
+# opencv4 는 pkg-config 가 전체 모듈을 뱉어낸다. 실제로 쓰는 것(core/imgproc/
+# imgcodecs/dnn + KCF 트래커용 tracking/video)만 직접 적어 링크 시간과 의존성을 줄인다.
 LDLIBS := -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn
 LDLIBS += -lopencv_tracking -lopencv_video
 LDLIBS += -lcamera -lcamera-base
@@ -55,18 +55,21 @@ run: all
 	fi
 
 # 개발용 도구. 본 프로그램과 별개로 빌드한다(main 이 각자 있으므로).
+#   servo_test   서보 캘리브레이션 (pigpiod 필요)
+#   button_poll  비상정지 측정 A — 유저스페이스 폴링
+#   button_wait  비상정지 측정 B — 커널 IRQ 대기
 tools: tools/servo_test tools/button_poll tools/button_wait
 
 tools/servo_test: tools/servo_test.cpp src/config.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ -lpigpiod_if2
 	@echo "빌드 완료 -> $@"
 
-# 유저스페이스 폴링 기준선 (A 단계). pigpio 를 쓰지 않는다 — 비교 대상이므로.
+# 유저스페이스 폴링 기준선 (A). pigpio 를 쓰지 않는다 — 비교 대상이므로.
 tools/button_poll: tools/button_poll.cpp
 	$(CXX) -std=c++17 -Wall -Wextra -O2 $< -o $@
 	@echo "빌드 완료 -> $@"
 
-# 커널 인터럽트를 기다리는 쪽 (B 단계)
+# 커널 인터럽트를 기다리는 쪽 (B)
 tools/button_wait: tools/button_wait.cpp
 	$(CXX) -std=c++17 -Wall -Wextra -O2 $< -o $@
 	@echo "빌드 완료 -> $@"

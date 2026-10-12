@@ -1,7 +1,8 @@
 # 측정 자료
 
 커널 서보 드라이버(`kernel/servo/`)를 만들면서 실측한 값들. 하드웨어가 있어야만
-얻을 수 있는 자료라 별도로 보관한다.
+얻을 수 있는 자료라 별도로 보관한다. 각 문서는 맨 위에 결론을 두고, 아래에 그
+결론에 이른 과정(틀렸던 판단 포함)을 시간순으로 적었다.
 
 | 파일 | 내용 |
 | --- | --- |
@@ -21,12 +22,14 @@ IMX219 CSI 카메라, MG90 서보 2개 (팬 GPIO12, 틸트 GPIO13)
 서보 펄스 0.5~2.5ms / 주기 20ms(50Hz) — 실측으로 정한 값
 ```
 
-펄스를 만드는 주체가 셋이고, 측정은 그 셋을 갈아 끼우며 한다.
+펄스를 만드는 방식이 넷이고, 측정은 그것을 갈아 끼우며 한다. `motor.backend` 와
+`/boot/config.txt` 의 오버레이 조합으로 고른다.
 
 ```
-servo    pigpiod 가 /dev/mem + DMA 로 만든다        (유저스페이스, 커널 우회)
-kservo   커널 모듈이 hrtimer 콜백으로 핀을 흔든다   (kernel/servo/servo.ko)
-syspwm   칩 안의 PWM 회로가 만든다                  (dtoverlay=pwm-2chan 필요)
+servo            pigpiod 가 /dev/mem + DMA 로 만든다          (유저스페이스, 커널 우회)
+kservo (hrtimer) 커널 모듈이 hrtimer 콜백으로 핀을 흔든다     (servo-pwm 오버레이 없음)
+kservo (PWM)     커널 모듈이 칩의 PWM 채널을 받아 duty 만 바꾼다 (servo-pwm 오버레이, 현재 기본)
+syspwm           칩의 PWM 을 /sys/class/pwm 으로 직접 쓴다     (커널 모듈 없음, 비교용)
 ```
 
 백엔드를 오갈 때 두 가지를 주의한다.

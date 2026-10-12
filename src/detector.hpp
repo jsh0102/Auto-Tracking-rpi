@@ -38,6 +38,6 @@ bool checkModel(const Config& cfg, std::string& error);
 // 추적할 대상 1명 선택.
 // 직전 타겟이 있으면 중심이 가장 가까운 검출을 이어서 따라가고(sticky),
 // 없으면 가장 큰 박스 = 가장 가까이 있는 사람을 고른다.
-// 아무것도 못 고르면 has_out 을 false 로 둔다.
+// 아무것도 못 고르면 false 를 돌려준다.
 bool selectTarget(const std::vector<Detection>& dets, const Detection* previous,
                   cv::Size frame_size, Detection& out);

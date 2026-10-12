@@ -1,4 +1,5 @@
-// button_wait — 커널 인터럽트를 기다려 비상정지를 처리한다 (B 단계)
+// button_wait — 커널 인터럽트를 기다려 비상정지를 처리한다
+// (docs/measurements/button_latency.md 의 B — 커널 IRQ + 유저 정지)
 //
 // button_poll 과 하는 일은 같다. 다른 것은 "어떻게 아느냐" 하나뿐이다.
 //

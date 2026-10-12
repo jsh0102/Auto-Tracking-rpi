@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 의존성 설치: libcamera-apps, ffmpeg, pigpiod, MediaMTX
+# 의존성 설치: 빌드 도구·라이브러리, ffmpeg, MediaMTX
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,16 +9,11 @@ log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 
 log "APT 패키지 설치"
 sudo apt-get update
+# pigpio 는 motor.backend=servo 와 tools/servo_test 용이다. 헤더가 있어야 빌드된다.
+# 데몬(pigpiod)은 켜지 않는다 — 기본 백엔드 kservo 는 커널 모듈이 같은 핀을 쓴다.
 sudo apt-get install -y \
-  libcamera-apps ffmpeg pigpio python3-gpiozero python3-numpy curl ca-certificates
-
-log "pigpiod 활성화 (서보 PWM 지터 제거용)"
-sudo systemctl enable --now pigpiod
-
-if ! python3 -c "import cv2" 2>/dev/null; then
-  log "OpenCV 설치"
-  sudo apt-get install -y python3-opencv
-fi
+  build-essential pkg-config libopencv-dev libcamera-dev libcamera-apps \
+  ffmpeg pigpio curl ca-certificates
 
 # --- MediaMTX -------------------------------------------------------------
 case "$(uname -m)" in
@@ -49,13 +44,18 @@ fi
 log "프로젝트 mediamtx.yml 연결"
 sudo ln -sfn "${ROOT}/mediamtx.yml" "${MEDIAMTX_DIR}/mediamtx.yml"
 
+# make run 과 scripts/*.sh 는 저장소 안의 bin/mediamtx 를 쓴다.
+mkdir -p "${ROOT}/bin"
+ln -sfn "${MEDIAMTX_DIR}/mediamtx" "${ROOT}/bin/mediamtx"
+
 cat <<MSG
 
 설치 완료.
 
   1) 검출 모델 내려받기:   ./scripts/download_model.sh
-  2) 서보 방향/범위 확인:  python3 scripts/calibrate_servo.py
-  3) 실행:                 ./scripts/run.sh
+  2) 빌드:                 make
+  3) 커널 서보 드라이버:   README 의 "커널 서보 드라이버" 절
+  4) 실행:                 make run
 
-  systemd 등록은 systemd/README 참고.
+  부팅 시 자동 실행:       ./systemd/install-services.sh
 MSG

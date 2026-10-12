@@ -1,9 +1,9 @@
 #!/bin/bash
-# C-4 서보 동작 확인 — 커널 드라이버(servo.ko)로 실제 서보를 움직인다.
+# 서보 동작 확인 — 커널 드라이버(servo.ko)로 실제 서보를 움직인다.
 #
 #   sudo ./test_servo.sh
 #
-# 카메라와 서보가 다른 방에 있으므로 시작 전에 걸어갈 시간을 준다.
+# 시작 전에 서보 앞으로 이동할 시간을 준다(WALK_SECONDS).
 # Ctrl+C 로 중단해도 펄스를 끊고 모듈을 내린다 — 안 그러면 서보가 계속
 # 힘을 준 채로 남아 발열한다.
 
@@ -12,7 +12,7 @@ set -u
 MOD_PATH="$(cd "$(dirname "$0")" && pwd)/servo.ko"
 MOD_NAME=servo
 DEV=/dev/servo0
-WALK_SECONDS=10		# 걸어갈 시간 (서보는 바로 옆방)
+WALK_SECONDS=10		# 서보 앞으로 이동할 시간
 HOLD=3			# 각 자세를 유지하는 시간
 
 die() { echo "오류: $*" >&2; exit 1; }
@@ -22,8 +22,8 @@ cleanup() {
 	echo
 	echo "==> 정리"
 	if [ -e "$DEV" ]; then
-		echo "pan 0"  > "$DEV" 2>/dev/null
-		echo "tilt 0" > "$DEV" 2>/dev/null
+		echo "pan off"  > "$DEV" 2>/dev/null
+		echo "tilt off" > "$DEV" 2>/dev/null
 		echo "    펄스 중단 (서보가 힘을 놓음)"
 	fi
 	if lsmod | grep -q "^$MOD_NAME "; then
@@ -71,7 +71,7 @@ send() {
 	sleep "$HOLD"
 }
 
-# 커널이 지금 무엇을 쏘고 있는지 읽어 본다 (C-5 에서 추가된 read).
+# 커널이 지금 무엇을 쏘고 있는지 읽어 본다 (cat /dev/servo0).
 show_state() {
 	echo "    ── cat $DEV ──"
 	sed 's/^/       /' "$DEV"

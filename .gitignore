@@ -35,7 +35,11 @@ modules.order
 # 동영상은 용량이 커서 추적하지 않는다 (로컬·외부 보관)
 *.mp4
 tools/button_poll
+tools/servo_test
 tools/button_wait
 
 # Claude Code 가 만드는 작업 폴더 (워크트리 등)
 .claude/
+
+# 개인 작업 산출물
+Claude outputs/

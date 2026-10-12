@@ -41,8 +41,8 @@
 					default-state = "off";
 
 					/* linux,default-trigger = "servo-estop"; 를 여기에 적으면
-					 * 부팅 직후부터 자동으로 따라간다. 지금은 손으로 연결해
-					 * 동작을 눈으로 확인한 뒤에 넣는다. */
+					 * 부팅 직후부터 자동으로 따라간다. 지금은 적지 않고
+					 * echo servo-estop > /sys/class/leds/estop/trigger 로 붙인다. */
 				};
 			};
 		};

@@ -1,8 +1,10 @@
 [Unit]
 Description=RTSP person-tracking pan/tilt camera
-After=network-online.target mediamtx.service pigpiod.service
+After=network-online.target mediamtx.service
 Wants=network-online.target
-Requires=mediamtx.service pigpiod.service
+Requires=mediamtx.service
+# 기본 백엔드(kservo)는 커널 모듈을 쓴다 — /etc/modules-load.d 로 부팅 시 적재한다.
+# motor.backend=servo 로 바꾸면 pigpiod.service 를 After/Requires 에 추가한다.
 
 [Service]
 Type=simple

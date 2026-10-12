@@ -7,8 +7,11 @@
 // 시작할 때 양쪽을 1500µs(정중앙)로 보낸다. 지금 서보가 어느 각도에 있는지 알 수
 // 없으므로, 어느 쪽 끝에서든 안쪽으로 들어오는 중앙이 가장 안전하다.
 //
+// pigpiod 로 펄스를 낸다. 커널 모듈(servo.ko)과 같은 핀을 쓰므로 모듈을 내린 뒤
+// 쓴다: sudo rmmod servo && sudo systemctl start pigpiod
+//
 //   빌드:  make tools
-//   실행:  ./tools/servo_test
+//   실행:  ./tools/servo_test [config.json]
 
 #include <pigpiod_if2.h>
 
@@ -144,7 +147,7 @@ int main(int argc, char** argv) {
     report("팬  ", pan_limits);
     report("틸트", tilt_limits);
     std::printf(
-        "\n이 값들로 config.json 의 min_pulse_ms/max_pulse_ms 와 가동범위를\n"
-        "정할 수 있습니다. 어떻게 환산할지는 같이 보죠.\n");
+        "\n이 값들로 config.json 의 min_pulse_ms/max_pulse_ms 와\n"
+        "pan_min/max, tilt_min/max 를 정합니다.\n");
     return 0;
 }

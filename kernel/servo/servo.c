@@ -2,20 +2,29 @@
 //
 // pigpio 는 /dev/mem 으로 GPIO 레지스터를 직접 만져 PWM 을 만든다. 커널을
 // 우회하므로 root 가 필요하고, 커널은 그 핀이 사용 중인 줄 모른다.
-// 이 모듈은 같은 일을 커널 안에서 hrtimer 로 한다.
+// 이 모듈은 서보 제어를 커널의 정식 경로로 옮긴다.
 //
-// 지금은 D 단계 — 커널이 GPIO 인터럽트로 눌림을 감지하고, 그 핸들러 안에서
-// 곧바로 서보를 멈춘다. 유저스페이스를 거치지 않는다.
+// 펄스 생성 — 두 경로가 있고, 적재 시점에 자동으로 정해진다.
+//   하드웨어 PWM  servo-pwm 오버레이가 있으면 probe 에서 PWM 채널을 받아
+//                 duty 만 바꾼다. 파형은 칩이 만들어 부하가 걸려도 흔들리지 않는다.
+//   hrtimer       오버레이가 없으면 타이머 콜백이 핀을 직접 올리고 내린다.
+//                 부하 시 지터가 생긴다 — 비교 측정을 위해 남겨 둔 경로다.
 //
-// 이것이 가능한 이유는 펄스를 커널이 만들기 때문이다. pigpio 였다면 멈출 대상이
-// 유저 프로세스라 핸들러에서 손댈 수 없었고, 하드웨어 PWM 이었다면 pwm_disable()
-// 이 might_sleep() 이라 인터럽트 문맥에서 부를 수 없었다.
+// 비상정지 — GPIO17 버튼 인터럽트를 커널이 받아 유저스페이스를 거치지 않고
+// 서보를 멈춘다. 정지 중에는 /dev/servo0 의 모든 명령을 -EBUSY 로 거부한다.
+// 하드웨어 PWM 은 pwm_apply_state() 가 잠들 수 있어 하드 IRQ 에서 끌 수 없으므로
+// 하반부(threaded IRQ)에서 끄거나(thread, 기본), 상반부에서 핀을 PWM 회로에서
+// 떼어낸다(pinmux). 상태는 LED 트리거로 발행한다.
+//
+// 주석의 A/B/D 는 docs/measurements/button_latency.md 의 측정 단계 이름이다.
+//   A 유저 폴링   B 커널 IRQ + 유저 정지   D 커널 IRQ + 커널 정지
 //
 //   echo "pan 1500"    > /dev/servo0    1500us 펄스 (기본 단위)
 //   echo "pan 30deg"   > /dev/servo0    30도 -> 커널이 us 로 환산
 //   echo "pan off"     > /dev/servo0    펄스 중단 (서보가 힘을 놓는다)
 //   cat /dev/servo0                     현재 상태
-//   cat /sys/class/servo/servo0/jitter  타이머 지터 통계
+//   cat /sys/class/servo/servo0/estop   비상정지 상태·지연 통계
+//   cat /sys/class/servo/servo0/jitter  hrtimer 경로의 타이머 지터 통계
 //   echo 0 > /sys/class/servo/servo0/jitter   통계 초기화
 //
 //   read(/dev/button0)  버튼이 눌릴 때까지 잠든다. 깨어나면 한 줄을 돌려준다:
@@ -156,8 +165,8 @@ struct button_reader {
 static int estop_mode = ESTOP_MODE_KERNEL;
 
 /* 실제로 어느 경로로 멈췄는지. 측정할 때 이 값이 곧 조건 이름이 된다.
- *   irq     상반부(하드 IRQ) 안에서 끝냈다      — GPIO 모드
- *   thread  하반부(커널 스레드)로 넘겨서 끝냈다 — 하드웨어 PWM 모드 */
+ *   irq     상반부(하드 IRQ) 안에서 끝냈다      — hrtimer 경로, 또는 PWM + pinmux
+ *   thread  하반부(커널 스레드)로 넘겨서 끝냈다 — PWM + thread */
 #define ESTOP_PATH_NONE   0
 #define ESTOP_PATH_IRQ    1
 #define ESTOP_PATH_THREAD 2
@@ -247,9 +256,10 @@ static void servo_pin_attach(unsigned int gpio)
 {
 	servo_pin_set_func(gpio, GPIO_FSEL_ALT0);
 }
+
 static bool estop_engaged;		/* 지금 비상정지가 걸려 있나 */
 
-// 핸들러 안에서 핀을 내리는 데 걸린 시간. D 의 지연이다.
+// 인터럽트를 받은 시각부터 펄스가 실제로 끊길 때까지 걸린 시간.
 static u64 estop_count;
 static u64 estop_sum_ns;
 static u64 estop_max_ns;
@@ -652,16 +662,16 @@ static enum hrtimer_restart servo_button_settle_fn(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
-// 인터럽트 핸들러 안에서 바로 불린다. 유저스페이스를 거치지 않는다.
-//
-// hrtimer_cancel() 은 여기서 부를 수 없다 — 다른 CPU 에서 도는 콜백이 끝나길
-// 기다리느라 잠들 수 있기 때문이다. 대신 두 가지를 한다:
-//   ① 핀을 지금 당장 LOW 로 내린다        → 서보는 이 순간 힘을 놓는다 (안전 확보)
-//   ② 펄스폭을 0 으로 둔다                → 다음 tick 에서 타이머가 스스로 끝난다
-// 정지/해제를 토글한다.
+// 비상정지를 걸거나 푼다(토글). 버튼 인터럽트에서 불린다.
 //   t0    지연 측정의 기준 시각. 상반부가 찍은 값을 그대로 넘겨받는다.
 //   slow  잠들 수 있는 자리인가. 하반부(스레드)에서만 true 다.
 //         true 일 때만 pwm_apply_state 를 부를 수 있다.
+//
+// hrtimer 경로에서는 hrtimer_cancel() 을 부를 수 없다 — 다른 CPU 에서 도는
+// 콜백이 끝나길 기다리느라 잠들 수 있기 때문이다. 대신 두 가지를 한다:
+//   ① 핀을 지금 당장 LOW 로 내린다        → 서보는 이 순간 힘을 놓는다 (안전 확보)
+//   ② 펄스폭을 0 으로 둔다                → 다음 tick 에서 타이머가 스스로 끝난다
+// 하드웨어 PWM 경로는 아래의 thread / pinmux 두 방법 중 하나로 끈다.
 static void servo_estop_toggle(ktime_t t0, bool slow)
 {
 	unsigned long flags;
@@ -746,9 +756,6 @@ static void servo_estop_toggle(ktime_t t0, bool slow)
 	led_trigger_event(run_led_trig,   engage ? LED_OFF  : LED_FULL);
 }
 
-// 하드웨어가 핀 변화를 보고 CPU 를 깨운다. 양쪽 엣지를 다 받는다 —
-// 떼는 것도 봐야 "이제 놓였구나" 를 알 수 있기 때문이다.
-// hrtimer 콜백과 같은 제약을 받는다: 잠들 수 없고, 짧아야 한다.
 // 하드웨어 PWM 을 쓰는 채널이 하나라도 있으면 하반부가 필요하다.
 static bool servo_estop_needs_thread(void)
 {
@@ -760,6 +767,9 @@ static bool servo_estop_needs_thread(void)
 	return false;
 }
 
+// 상반부. 하드웨어가 핀 변화를 보고 CPU 를 깨운다. 양쪽 엣지를 다 받는다 —
+// 떼는 것도 봐야 "이제 놓였구나" 를 알 수 있기 때문이다.
+// hrtimer 콜백과 같은 제약을 받는다: 잠들 수 없고, 짧아야 한다.
 static irqreturn_t servo_button_isr(int irq, void *dev_id)
 {
 	// 인터럽트를 받은 시각. 이후 모든 지연 측정의 기준점이다.
@@ -802,7 +812,8 @@ static irqreturn_t servo_button_isr(int irq, void *dev_id)
 				return IRQ_WAKE_THREAD;
 			}
 
-			// GPIO 모드: 핀을 내리는 것뿐이라 여기서 끝낸다 (D 와 동일).
+			// hrtimer 경로(핀을 내리기만 하면 됨) 또는 pinmux 방법:
+			// 잠들 일이 없으므로 여기서 끝낸다.
 			WRITE_ONCE(estop_path, ESTOP_PATH_IRQ);
 			servo_estop_toggle(now, false);
 		}
@@ -1105,10 +1116,13 @@ static DEVICE_ATTR_RO(level);
 // 비상정지 상태와 모드.
 //
 //   cat /sys/class/servo/servo0/estop
-//   mode kernel  engaged 0  stops 5  avg 1.8us  max 3.2us
+//   mode kernel  method thread  path thread  engaged 0  stops 6  avg 45.7us  max 61.1us
 //
+//   echo kernel > .../estop     커널이 직접 멈춘다 (D, 기본)
 //   echo user   > .../estop     커널은 알리기만 한다 (B 측정용)
-//   echo kernel > .../estop     커널이 핸들러 안에서 직접 멈춘다 (D)
+//   echo thread > .../estop     하드웨어 PWM 을 하반부에서 정식 API 로 끈다 (기본)
+//   echo pinmux > .../estop     하드웨어 PWM 핀을 상반부에서 떼어낸다
+//   echo clear  > .../estop     정지 해제 + 통계 초기화
 //
 // 모드를 남겨 둔 이유: D 를 넣고 나면 커널이 항상 멈춰 버려서 B 를 다시 잴
 // 방법이 없어진다. 측정을 재현하려면 조건을 고를 수 있어야 한다.
@@ -1187,8 +1201,9 @@ static ssize_t estop_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 	}
 
-	pr_info("estop: mode=%s\n",
-		READ_ONCE(estop_mode) == ESTOP_MODE_KERNEL ? "kernel" : "user");
+	pr_info("estop: mode=%s method=%s\n",
+		READ_ONCE(estop_mode) == ESTOP_MODE_KERNEL ? "kernel" : "user",
+		READ_ONCE(estop_method) == ESTOP_METHOD_PINMUX ? "pinmux" : "thread");
 	return count;
 }
 static DEVICE_ATTR_RW(estop);
@@ -1330,12 +1345,10 @@ static void servo_channel_teardown(struct servo_channel *ch)
 	ch->desc = NULL;
 }
 
-// 커널 코드의 정리 방식: 성공한 것만 거꾸로 되돌린다.
-// 유저 프로그램은 죽으면 OS 가 회수해 주지만, 커널은 회수해 줄 상위 존재가 없다.
-// ── 디바이스 트리에 붙기 ────────────────────────────────────────
+// ───────────────────────── 디바이스 트리에 붙기 ─────────────────────────
 //
-// 지금까지 이 모듈은 insmod 하면 무조건 실행되는 구조였다. 여기서부터는
-// "장치가 있으면 커널이 드라이버를 불러 주는" 정상적인 형태를 함께 갖춘다.
+// 모듈 자체는 insmod 하면 바로 동작하고(hrtimer 경로), 여기에 더해
+// "장치가 있으면 커널이 드라이버를 불러 주는" platform driver 형태를 함께 갖춘다.
 //
 //   servo-pwm.dtbo 가 /servo 노드를 만든다  →  커널이 compatible 을 보고
 //   이 드라이버를 찾는다  →  servo_probe() 가 불린다  →  PWM 채널을 받는다
@@ -1393,8 +1406,8 @@ static int servo_probe(struct platform_device *pdev)
 			 state.enabled ? "켜짐" : "꺼짐");
 	}
 
-	// 아직 쓰지는 않는다. 펄스는 여전히 hrtimer 가 만든다.
-	dev_info(&pdev->dev, "PWM %zu채널 확보 (펄스 생성은 아직 hrtimer)\n",
+	// 이제부터 servo_set_pulse 는 ch->pwm 을 보고 하드웨어 PWM 으로 펄스를 낸다.
+	dev_info(&pdev->dev, "PWM %zu채널 확보 — 펄스 생성은 하드웨어 PWM\n",
 		 ARRAY_SIZE(servo_ch));
 	return 0;
 }
@@ -1432,6 +1445,8 @@ static struct platform_driver servo_pdrv = {
 	.remove = servo_remove,
 };
 
+// 실패하면 성공한 단계만 거꾸로 되돌린다(goto 사다리).
+// 유저 프로그램은 죽으면 OS 가 회수해 주지만, 커널은 회수해 줄 상위 존재가 없다.
 static int __init servo_init(void)
 {
 	int ret, i;
@@ -1561,7 +1576,8 @@ err_channel:
 }
 
 // 순서가 중요하다.
-//   먼저 장치 노드를 없앤다    -> 새 요청이 들어올 길을 끊는다
+//   먼저 platform driver 를 뗀다 -> servo_remove 가 PWM 펄스를 끊고 반납한다
+//   그다음 장치 노드를 없앤다    -> 새 요청이 들어올 길을 끊는다
 //   그다음 인터럽트를 뗀다      -> 더 이상 핸들러가 불리지 않게 한다
 //   그다음 타이머를 세운다      -> 더 이상 콜백이 불리지 않게 한다
 //   마지막에 핀을 반납한다      -> 아무도 안 만지는 상태에서
@@ -1569,7 +1585,7 @@ static void __exit servo_exit(void)
 {
 	int i;
 
-	// 새 요청이 들어올 길부터 끊는다. probe/remove 가 도는 중이면 끝나길 기다린다.
+	// probe/remove 가 도는 중이면 끝나길 기다린다.
 	platform_driver_unregister(&servo_pdrv);
 
 	// 트리거를 없애면 붙어 있던 LED 들은 자동으로 "none" 으로 돌아간다.

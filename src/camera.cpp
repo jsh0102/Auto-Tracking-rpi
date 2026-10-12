@@ -377,7 +377,8 @@ void DirectSource::encodeLoop() {
         }
         if (frame.size() < main_bytes_) continue;
 
-        // YUV420 의 맨 앞 921,600 바이트가 Y(밝기) 평면이다. 여기에만 그린다.
+        // YUV420 의 맨 앞 width x height 바이트(1280x720 이면 921,600)가 Y(밝기) 평면이다.
+        // 여기에만 그린다.
         cv::Mat y(main_size_.height, main_size_.width, CV_8UC1, frame.data(),
                   main_size_.width);
         drawOverlay(y);

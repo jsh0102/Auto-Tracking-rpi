@@ -1,6 +1,6 @@
 #pragma once
 
-// printf 형식의 아주 작은 로거. 출력 형식은 파이썬 판과 맞췄다:
+// printf 형식의 아주 작은 로거. 한 줄 형식:
 //   15:23:03 INFO    camera: 시작
 enum class LogLevel { Debug = 0, Info, Warning, Error };
 

@@ -38,10 +38,10 @@ struct DetectConfig {
 };
 
 struct MotorConfig {
-    std::string backend = "servo";      // servo(pigpio) | kservo(커널 드라이버) | dummy
+    std::string backend = "servo";      // servo(pigpio) | kservo(커널 드라이버) | syspwm | dummy
     int pan_pin = 12;                   // BCM 번호
     int tilt_pin = 13;
-    // MG90(S) 기본값. 개체차가 크므로 scripts/calibrate_servo.py 로 실측 권장.
+    // MG90(S) 기본값. 개체차가 크므로 tools/servo_test 로 실측 권장.
     double min_pulse_ms = 0.5;
     double max_pulse_ms = 2.4;
     double pan_min = -80.0;             // 기구적 가동 범위 (deg)

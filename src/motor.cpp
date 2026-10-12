@@ -53,12 +53,12 @@ private:
     double tilt_;
 };
 
-// 두 백엔드의 공통부.
+// servo / kservo / syspwm 세 백엔드의 공통부.
 //
 // 각도를 펄스폭(µs)으로 바꾸고, 가동 범위로 자르고, invert 를 적용하고, 멈춘 지
-// 오래되면 펄스를 끊는 것까지는 pigpio 든 커널 드라이버든 완전히 같다.
+// 오래되면 펄스를 끊는 것까지는 어느 백엔드든 완전히 같다.
 // 다른 것은 "만든 펄스폭을 어디로 보내느냐" 하나뿐이라, 그 한 가지만 파생
-// 클래스가 채우게 했다. 복사해 두 벌을 만들면 한쪽만 고치는 사고가 난다.
+// 클래스가 채우게 했다. 복사해 여러 벌을 만들면 한쪽만 고치는 사고가 난다.
 class PulseServoPanTilt : public PanTilt {
 public:
     explicit PulseServoPanTilt(const MotorConfig& cfg)
@@ -202,7 +202,8 @@ private:
 
 // backend=kservo — 커널 모듈(kernel/servo/servo.ko)에 써서 구동한다.
 //
-// 펄스는 커널이 hrtimer 로 만든다. 여기서는 장치 파일에 한 줄 쓰는 게 전부다.
+// 펄스는 커널 모듈이 만든다(servo-pwm 오버레이가 있으면 하드웨어 PWM, 없으면 hrtimer).
+// 여기서는 장치 파일에 한 줄 쓰는 게 전부다. 비상정지 상태도 커널이 들고 있다.
 //
 //   pan 1683us     펄스폭 지정
 //   pan off        펄스 중단
@@ -232,7 +233,7 @@ public:
         startServo();
     }
 
-    // 제어 루프마다 한 번 읽는다(초당 5회). 한 번에 3µs 남짓이라 부담이 없다.
+    // 제어 루프마다 한 번 읽는다. pread 한 번이라 부담이 없다.
     bool emergencyStopped() const override {
         if (estop_fd_ < 0) return false;
 
@@ -241,7 +242,7 @@ public:
         if (n <= 0) return false;
         buf[n] = '\0';
 
-        // "mode kernel  engaged 1  stops 3 ..."
+        // "mode kernel  method thread  path thread  engaged 1  stops 3 ..."
         const char* p = std::strstr(buf, "engaged ");
         return p && p[8] == '1';
     }
@@ -301,8 +302,8 @@ private:
 //
 // ★ 이 백엔드에는 비상정지가 없다 — emergencyStopped() 는 기본값 false 를 쓴다.
 //   커널 모듈이 빠진 그림이라 버튼 IRQ 를 받을 주체가 없다. 하드웨어 PWM 이
-//   추적 흔들림을 얼마나 줄이는지 재기 위한 실험용 백엔드이고, 비상정지는
-//   커널 모듈을 PWM 소비자로 개조하면서 되찾는다.
+//   추적 흔들림을 얼마나 줄이는지 재기 위해 만든 비교용 백엔드다.
+//   하드웨어 PWM 과 비상정지를 함께 쓰려면 kservo 를 쓴다(커널 모듈이 PWM 소비자).
 class SysPwmPanTilt : public PulseServoPanTilt {
 public:
     explicit SysPwmPanTilt(const MotorConfig& cfg) : PulseServoPanTilt(cfg) {
